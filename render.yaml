@@ -1,0 +1,41 @@
+# render.yaml — One-click deploy config for Render.com
+# Docs: https://render.com/docs/render-yaml-spec
+
+services:
+  - type: web
+    name: legalx-backend
+    runtime: node
+    region: singapore   # closest to India — lowest latency
+    plan: free
+
+    # Build
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    # Health check — Render will restart the service if this fails
+    healthCheckPath: /health
+
+    # Environment variables
+    # Add SECRET values in the Render dashboard (Environment > Secret Files / Env Vars)
+    # Only non-secret defaults are listed here
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+
+      # Render injects this automatically — used by keepAlive cron
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: legalx-backend
+          type: web
+          property: host
+
+      # ── Secrets — set these in Render Dashboard ────────────────────────────
+      # SUPABASE_URL
+      # SUPABASE_SERVICE_ROLE_KEY
+      # RAZORPAY_KEY_ID
+      # RAZORPAY_KEY_SECRET
+      # RESEND_API_KEY
+      # ADMIN_SECRET
+      # ALLOWED_ORIGINS  (e.g. https://legalxonline.com,https://legalxonline.netlify.app)
