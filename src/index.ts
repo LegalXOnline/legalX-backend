@@ -60,10 +60,11 @@ app.use((req, res, next) => {
   const secret = csrfProtection.secretSync()
   req.csrfSecret = secret
   const token = csrfProtection.create(secret)
+  const isProd = process.env.NODE_ENV === 'production'
   res.cookie(CSRF_COOKIE_NAME, token, {
     httpOnly: false, // Must be readable by frontend JS
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax', // 'none' allows cross-origin AJAX with credentials
     path: '/',
   })
   res.locals.csrfToken = token
@@ -91,6 +92,10 @@ app.use(cors({
   origin: (origin, cb) => {
     // allow curl / server-side calls (no origin header)
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true)
+    // Allow any vercel.app or netlify.app subdomain in production for preview deployments
+    if (process.env.NODE_ENV === 'production' && (origin.endsWith('.vercel.app') || origin.endsWith('.netlify.app'))) {
+      return cb(null, true)
+    }
     cb(new Error(`CORS: ${origin} not allowed`))
   },
   credentials: true, // Required for cookies to be sent cross-origin
