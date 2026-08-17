@@ -58,7 +58,7 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
     res.cookie('lx_access_token', access_token, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: isProduction ? 'strict' : 'lax',
+      sameSite: isProduction ? 'none' : 'lax',
       maxAge: expires_in * 1000,
       path: '/',
     })
@@ -66,7 +66,7 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
     res.cookie('lx_refresh_token', refresh_token, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: isProduction ? 'strict' : 'lax',
+      sameSite: isProduction ? 'none' : 'lax',
       maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
       path: '/',
     })
