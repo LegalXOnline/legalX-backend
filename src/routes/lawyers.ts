@@ -35,7 +35,7 @@ function mapRow(d: any) {
 }
 
 // ── GET /api/lawyers ─────────────────────────────────────────────────────────
-router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/', async (_req: Request, res: Response) => {
   try {
     const { data, error } = await supabase
       .from('lawyer_profiles')
@@ -43,10 +43,16 @@ router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
       .eq('verification_status', 'verified')
       .order('avg_rating', { ascending: false })
 
-    if (error) throw error
+    if (error) {
+      // Table may not exist yet — return empty array, not 500
+      console.warn('[lawyers] DB query failed, returning empty list:', error.message)
+      res.json({ lawyers: [] })
+      return
+    }
     res.json({ lawyers: (data ?? []).map(mapRow) })
   } catch (err) {
-    next(err)
+    console.error('[lawyers] Unexpected error:', err)
+    res.json({ lawyers: [] })
   }
 })
 
