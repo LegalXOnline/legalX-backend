@@ -1,10 +1,10 @@
 import { Resend } from 'resend'
 
 const resend = new Resend(process.env.RESEND_API_KEY!)
-const ADMIN = process.env.ADMIN_EMAIL || 'legalxonline@gmail.com'
+const ADMIN = process.env.ADMIN_EMAIL || 'contact@legalxonline.com'
 const FROM = 'LegalX <noreply@legalxonline.com>'
 
-// ── Alert admin about a new lead ─────────────────────────────────────────────
+// ── Alert admin about a new lead
 export async function sendLeadAlert(lead: {
   name: string
   phone: string
@@ -15,7 +15,7 @@ export async function sendLeadAlert(lead: {
     await resend.emails.send({
       from: FROM,
       to: ADMIN,
-      subject: `🔔 New Lead: ${lead.name} — ${lead.serviceTitle}`,
+      subject: `New Lead: ${lead.name} — ${lead.serviceTitle}`,
       html: `
         <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
           <h2 style="margin:0 0 16px;color:#111">New Lead on LegalX</h2>
@@ -41,7 +41,7 @@ export async function sendLeadAlert(lead: {
   }
 }
 
-// ── Confirm to user that we received their request ───────────────────────────
+// ── Confirm to user that we received their request
 export async function sendUserConfirmation(to: string, name: string, serviceTitle: string) {
   if (!to) return
   try {
@@ -62,7 +62,7 @@ export async function sendUserConfirmation(to: string, name: string, serviceTitl
           <div style="margin:24px 0;padding:16px;background:#fafafa;border-left:4px solid #f5a623">
             <p style="margin:0;color:#333;font-size:14px">
               If you have any urgent questions, email us at
-              <a href="mailto:legalxonline@gmail.com" style="color:#f5a623">legalxonline@gmail.com</a>
+              <a href="mailto:contact@legalxonline.com" style="color:#f5a623">contact@legalxonline.com</a>
             </p>
           </div>
           <p style="color:#888;font-size:12px;margin-top:32px">LegalX Online · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222</p>
@@ -74,7 +74,7 @@ export async function sendUserConfirmation(to: string, name: string, serviceTitl
   }
 }
 
-// ── Payment success email ─────────────────────────────────────────────────────
+// ── Payment success email
 export async function sendPaymentSuccess(opts: {
   toEmail?: string
   name: string
@@ -87,7 +87,7 @@ export async function sendPaymentSuccess(opts: {
   await resend.emails.send({
     from: FROM,
     to: ADMIN,
-    subject: `💰 Payment Received: ${opts.name} — ${opts.serviceTitle} (₹${amountRs})`,
+    subject: `Payment Received: ${opts.name} — ${opts.serviceTitle} (₹${amountRs})`,
     html: `<p>Payment of ₹${amountRs} received for <b>${opts.serviceTitle}</b> from ${opts.name}.<br>Application ID: ${opts.applicationId}</p>`,
   }).catch(console.error)
 
@@ -107,5 +107,35 @@ export async function sendPaymentSuccess(opts: {
         </div>
       `,
     }).catch(console.error)
+  }
+}
+
+// ── Welcome new user
+export async function sendWelcomeEmail(to: string, name: string, role: string) {
+  if (!to) return
+  const roleText = role === 'lawyer' ? 'Lawyer Account' : 'Client Account'
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to,
+      subject: `Welcome to LegalXOnline — Your ${roleText} is ready`,
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 12px;color:#111">Welcome to LegalX, ${name}!</h2>
+          <p style="color:#555;line-height:1.6">
+            Your <strong>${roleText}</strong> has been successfully created.
+          </p>
+          <p style="color:#555;line-height:1.6">
+            You can now log in to your dashboard to access India's most trusted legal tech platform.
+          </p>
+          <div style="margin-top:32px;padding-top:24px;border-top:1px solid #eee;color:#888;font-size:12px">
+            LegalXOnline Team<br/>
+            contact@legalxonline.com
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] welcome email failed:', err)
   }
 }
