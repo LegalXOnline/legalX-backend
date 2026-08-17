@@ -127,4 +127,10 @@ router.get('/me', async (req: Request, res: Response) => {
   }
 })
 
+// ── GET /api/auth/csrf ──────────────────────────────────────────────────────────
+// Get CSRF token for mutations (cookie is set by global middleware)
+router.get('/csrf', (_req: Request, res: Response) => {
+  res.json({ csrfToken: res.locals.csrfToken })
+})
+
 export default router
