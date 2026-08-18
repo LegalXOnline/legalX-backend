@@ -32,23 +32,37 @@ router.post('/agora', async (req: Request, res: Response) => {
     }
 
     // ── Verify Agora HMAC signature ───────────────────────────────────────────
-    // Agora sends: x-agora-signature-v2 header with HMAC-SHA256 of raw body
-    const signature = req.headers['x-agora-signature-v2'] as string
-    if (!signature) {
-      res.status(401).json({ error: 'Missing webhook signature' })
-      return
-    }
+    // Agora v2: header 'agora-signature-v2', HMAC-SHA256
+    // Agora v1: header 'agora-signature',    HMAC-SHA1 (legacy fallback)
+    const sigV2 = req.headers['agora-signature-v2'] as string
+    const sigV1 = req.headers['agora-signature'] as string
 
+    // Raw body for HMAC — must stringify consistently
     const rawBody = JSON.stringify(req.body)
-    const expectedSig = crypto
-      .createHmac('sha256', webhookSecret)
-      .update(rawBody)
-      .digest('hex')
 
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
-      console.warn('[webhook/agora] Invalid signature — possible spoofed request')
-      res.status(401).json({ error: 'Invalid signature' })
-      return
+    if (sigV2) {
+      // V2: HMAC-SHA256
+      const expected = crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex')
+      const sigBuf = Buffer.from(sigV2.padEnd(expected.length, '\x00'))
+      const expBuf = Buffer.from(expected)
+      if (sigV2.length !== expected.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        console.warn('[webhook/agora] Invalid v2 signature')
+        res.status(401).json({ error: 'Invalid signature' }); return
+      }
+    } else if (sigV1) {
+      // V1: HMAC-SHA1
+      const expected = crypto.createHmac('sha1', webhookSecret).update(rawBody).digest('hex')
+      const sigBuf = Buffer.from(sigV1.padEnd(expected.length, '\x00'))
+      const expBuf = Buffer.from(expected)
+      if (sigV1.length !== expected.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        console.warn('[webhook/agora] Invalid v1 signature')
+        res.status(401).json({ error: 'Invalid signature' }); return
+      }
+    } else {
+      // No signature — health check ping or unknown request
+      // Agora health check POST has no signature body; return 200 to pass the check
+      console.info('[webhook/agora] No signature — treating as health check ping')
+      res.json({ ok: true }); return
     }
 
     // ── Process event ─────────────────────────────────────────────────────────
