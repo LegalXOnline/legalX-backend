@@ -16,6 +16,7 @@ import lawyersRouter from './routes/lawyers'
 import adminRouter from './routes/admin'
 import consultationsRouter from './routes/consultations'
 import webhooksRouter from './routes/webhooks'
+import notificationsRouter from './routes/notifications'
 
 // Extend Express Request type
 declare global {
@@ -161,9 +162,11 @@ app.get('/health', async (_req, res) => {
 })
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-// Webhook routes — NO CSRF, NO auth middleware. Security via HMAC signature only.
-// Agora Message Notification Service → POST /api/webhooks/agora
+// Webhook routes — NO CSRF, secured by HMAC signature
 app.use('/api/webhooks', webhooksRouter)
+
+// SSE notification stream — GET only, auth via cookie, no CSRF needed
+app.use('/api/notifications', notificationsRouter)
 
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
 // Phase 1.2: Auth endpoints get a stricter rate limit
