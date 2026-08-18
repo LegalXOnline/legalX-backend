@@ -3,6 +3,8 @@ import { supabase, supabaseAuth } from '../lib/supabase'
 import { sendWelcomeEmail } from '../lib/email'
 import { validateBody, authSignupSchema, authLoginSchema } from '../lib/validation'
 
+import { rateLimit } from 'express-rate-limit'
+
 const router = Router()
 
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────

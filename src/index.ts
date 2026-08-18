@@ -14,6 +14,7 @@ import paymentRouter from './routes/payment'
 import authRouter from './routes/auth'
 import lawyersRouter from './routes/lawyers'
 import adminRouter from './routes/admin'
+import consultationsRouter from './routes/consultations'
 
 // Extend Express Request type
 declare global {
@@ -123,13 +124,6 @@ app.use(cors({
 // Global rate limit — 100 req / 15 min per IP
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true }))
 
-// Phase 1.2: Strict auth rate limit — 5 req / 15 min (brute-force protection)
-const authRateLimit = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  message: { error: 'Too many attempts. Please try again in 15 minutes.' },
-})
 
 app.use(express.json({ limit: '1mb' }))
 
@@ -168,7 +162,7 @@ app.get('/health', async (_req, res) => {
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
 // Phase 1.2: Auth endpoints get a stricter rate limit
-app.use('/api/auth', authRateLimit, authRouter)
+app.use('/api/auth', authRouter)
 app.use('/api/lawyers', lawyersRouter)
 
 // Protected routes with CSRF validation
@@ -176,6 +170,7 @@ app.use('/api/leads', validateCsrf, leadsRouter)
 app.use('/api/applications', validateCsrf, applicationsRouter)
 app.use('/api/payment', validateCsrf, paymentRouter)
 app.use('/api/admin', validateCsrf, adminRouter)
+app.use('/api/consultations', validateCsrf, consultationsRouter)
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
