@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express'
 import Razorpay from 'razorpay'
-import jwt from 'jsonwebtoken'
-import { v4 as uuidv4 } from 'uuid'
+import { RtcTokenBuilder, RtcRole } from 'agora-token'
+import crypto from 'crypto'
 import { supabase } from '../lib/supabase'
 import { validateBody } from '../lib/validation'
 import { z } from 'zod'
@@ -24,20 +24,32 @@ async function getAuthUser(req: Request) {
   return data.user
 }
 
-// ── 100ms JWT helpers ─────────────────────────────────────────────────────────
-function generateHmsManagementToken(): string {
-  return jwt.sign(
-    { access_key: process.env.HMS_APP_ID!, type: 'management', version: 2 },
-    process.env.HMS_APP_SECRET!,
-    { algorithm: 'HS256', expiresIn: '30s', jwtid: uuidv4() }
-  )
+// ── Agora token helpers ───────────────────────────────────────────────────────
+// Channel = consultationId (unique per session)
+// uid = numeric hash of userId string (Agora requires uint32)
+function userIdToUid(userId: string): number {
+  // Deterministic numeric UID from UUID string
+  const hash = crypto.createHash('md5').update(userId).digest()
+  return hash.readUInt32BE(0)
 }
 
-function generateHmsRoomToken(roomId: string, userId: string, role: 'client' | 'host'): string {
-  return jwt.sign(
-    { access_key: process.env.HMS_APP_ID!, room_id: roomId, user_id: userId, role, type: 'app', version: 2 },
-    process.env.HMS_APP_SECRET!,
-    { algorithm: 'HS256', expiresIn: '1h', jwtid: uuidv4() }
+function generateAgoraToken(channelName: string, userId: string, role: 'client' | 'host'): string {
+  const appId = process.env.AGORA_APP_ID!
+  const appCertificate = process.env.AGORA_APP_CERTIFICATE!
+  const uid = userIdToUid(userId)
+  const agoraRole = role === 'host' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER
+  const expirationSecs = 3600 // 1 hour
+  const currentTimestamp = Math.floor(Date.now() / 1000)
+  const privilegeExpiredTs = currentTimestamp + expirationSecs
+
+  return RtcTokenBuilder.buildTokenWithUid(
+    appId,
+    appCertificate,
+    channelName,
+    uid,
+    agoraRole,
+    privilegeExpiredTs,
+    privilegeExpiredTs,
   )
 }
 
@@ -153,33 +165,17 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
       res.status(400).json({ error: 'Payment not authorized' }); return
     }
 
-    // Create 100ms room (server-side, APP_SECRET never leaves backend)
-    const mgmtToken = generateHmsManagementToken()
-    const roomRes = await fetch('https://api.100ms.live/v2/rooms', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${mgmtToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: `legalx-${consultationId}`,
-        description: `LegalX ${consultation.type} consultation`,
-        template_id: process.env.HMS_TEMPLATE_ID,
-      }),
-    })
+    // Agora: channel = consultationId (no server-side room creation needed)
+    // The channel is created automatically when the first user joins
+    const channelName = consultationId
+    const clientToken = generateAgoraToken(channelName, user.id, 'client')
 
-    if (!roomRes.ok) {
-      // Room creation failed — void pre-auth and return error
-      try { await (razorpay.payments as any).cancel(razorpayPaymentId) } catch {}
-      res.status(500).json({ error: 'Failed to create consultation room. Payment voided.' }); return
-    }
-
-    const room = await roomRes.json() as any
-    const clientToken = generateHmsRoomToken(room.id, user.id, 'client')
-
-    // Update DB: in_progress + save IDs
+    // Update DB: in_progress + save IDs (hms_room_id repurposed as agora_channel)
     await supabase.from('consultations').update({
       status: 'in_progress',
       razorpay_payment_id: razorpayPaymentId,
-      hms_room_id: room.id,
-      hms_session_id: room.id, // 100ms session ID comes from webhook; use room ID as temp
+      hms_room_id: channelName,        // agora channel name = consultationId
+      hms_session_id: channelName,     // used for webhook matching
       payment_status: 'authorized',
     }).eq('id', consultationId)
 
@@ -192,7 +188,13 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
       expires_at: new Date(Date.now() + 20_000).toISOString(),
     })
 
-    res.json({ consultationId, roomId: room.id, authToken: clientToken })
+    res.json({
+      consultationId,
+      channelName,
+      agoraAppId: process.env.AGORA_APP_ID!,
+      authToken: clientToken,
+      uid: userIdToUid(user.id),
+    })
   } catch (err) {
     console.error('[consultations/token]', err)
     res.status(500).json({ error: 'Internal server error' })
@@ -214,11 +216,18 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
     if (consultation.lawyer_id !== user.id) { res.status(403).json({ error: 'Not your consultation' }); return }
     if (!consultation.hms_room_id) { res.status(400).json({ error: 'Room not ready' }); return }
 
-    const lawyerToken = generateHmsRoomToken(consultation.hms_room_id, user.id, 'host')
+    const channelName = consultation.hms_room_id // stored as consultationId
+    const lawyerToken = generateAgoraToken(channelName, user.id, 'host')
 
     await supabase.from('consultations').update({ started_at: new Date().toISOString() }).eq('id', req.params.id)
 
-    res.json({ consultationId: req.params.id, roomId: consultation.hms_room_id, authToken: lawyerToken })
+    res.json({
+      consultationId: req.params.id,
+      channelName,
+      agoraAppId: process.env.AGORA_APP_ID!,
+      authToken: lawyerToken,
+      uid: userIdToUid(user.id),
+    })
   } catch (err) {
     console.error('[consultations/accept]', err)
     res.status(500).json({ error: 'Internal server error' })
