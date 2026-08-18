@@ -15,6 +15,7 @@ import authRouter from './routes/auth'
 import lawyersRouter from './routes/lawyers'
 import adminRouter from './routes/admin'
 import consultationsRouter from './routes/consultations'
+import webhooksRouter from './routes/webhooks'
 
 // Extend Express Request type
 declare global {
@@ -160,6 +161,9 @@ app.get('/health', async (_req, res) => {
 })
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+// Webhook routes — NO CSRF, NO auth middleware. Security via HMAC signature only.
+app.use('/api/webhooks', webhooksRouter)
+
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
 // Phase 1.2: Auth endpoints get a stricter rate limit
 app.use('/api/auth', authRouter)
