@@ -52,7 +52,7 @@ router.post('/agora', async (req: Request, res: Response) => {
     // Agora event types:
     // 103 = channel create, 104 = channel destroy (all users left)
     // 111 = broadcaster join, 112 = broadcaster leave
-    if (event.eventType !== 104) {
+    if (event.eventType !== 102) { // 102 = channel destroy (all users left)
       // Not a channel destroy event — acknowledge and ignore
       res.json({ received: true })
       return
