@@ -50,30 +50,49 @@ app.use((req, res, next) => {
   next()
 })
 
+// Parse cookies before CSRF middleware reads req.signedCookies
+app.use(cookieParser(process.env.COOKIE_SECRET || 'lx_cookie_secret_change_in_prod'))
+
 // ── CSRF Protection ──────────────────────────────────────────────────────────────
 const csrfProtection = new csrf()
 const CSRF_COOKIE_NAME = 'csrf_token'
+const CSRF_SECRET_COOKIE = 'csrf_secret' // Phase 1.4: session-scoped secret
 const CSRF_HEADER_NAME = 'x-csrf-token'
+const isProd = process.env.NODE_ENV === 'production'
 
-// Generate CSRF token for each session
+// Phase 1.4: Store CSRF secret in signed HttpOnly cookie (per-session, not per-request)
+// This prevents CSRF token mismatch when navigating between pages
 app.use((req, res, next) => {
-  const secret = csrfProtection.secretSync()
+  let secret = req.signedCookies?.[CSRF_SECRET_COOKIE]
+  if (!secret) {
+    secret = csrfProtection.secretSync()
+    res.cookie(CSRF_SECRET_COOKIE, secret, {
+      httpOnly: true,
+      signed: true,
+      secure: isProd,
+      sameSite: isProd ? 'none' : 'lax',
+      path: '/',
+    })
+  }
   req.csrfSecret = secret
   const token = csrfProtection.create(secret)
-  const isProd = process.env.NODE_ENV === 'production'
   res.cookie(CSRF_COOKIE_NAME, token, {
     httpOnly: false, // Must be readable by frontend JS
     secure: isProd,
-    sameSite: isProd ? 'none' : 'lax', // 'none' allows cross-origin AJAX with credentials
+    sameSite: isProd ? 'none' : 'lax',
     path: '/',
   })
   res.locals.csrfToken = token
   next()
 })
 
-// Validate CSRF token on state-changing requests
+// Phase 1.1: Validate CSRF — skip entirely for mobile Bearer token requests
+// Mobile apps (React Native) cannot be CSRF-attacked; forcing cookies is unnecessary
 const validateCsrf = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next()
+
+  // Phase 1.1: Mobile clients use Bearer tokens — CSRF not applicable
+  if (req.headers.authorization?.startsWith('Bearer ')) return next()
 
   const token = req.headers[CSRF_HEADER_NAME] as string || req.body._csrf
   const secret = req.csrfSecret
@@ -104,8 +123,16 @@ app.use(cors({
 // Global rate limit — 100 req / 15 min per IP
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true }))
 
+// Phase 1.2: Strict auth rate limit — 5 req / 15 min (brute-force protection)
+const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  message: { error: 'Too many attempts. Please try again in 15 minutes.' },
+})
+
 app.use(express.json({ limit: '1mb' }))
-app.use(cookieParser()) // Parse HttpOnly cookies for auth
+
 
 // ── Health check ─────────────────────────────────────────────────────────────
 import { supabase } from './lib/supabase'
@@ -140,7 +167,8 @@ app.get('/health', async (_req, res) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
-app.use('/api/auth', authRouter)
+// Phase 1.2: Auth endpoints get a stricter rate limit
+app.use('/api/auth', authRateLimit, authRouter)
 app.use('/api/lawyers', lawyersRouter)
 
 // Protected routes with CSRF validation

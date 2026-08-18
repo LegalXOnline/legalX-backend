@@ -19,7 +19,15 @@ router.post('/signup', validateBody(authSignupSchema), async (req: Request, res:
     })
 
     if (error) {
-      res.status(400).json({ error: error.message })
+      // Phase 1.3: Never leak raw Supabase error text — normalize to safe messages
+      const isDuplicate = error.message.toLowerCase().includes('already') ||
+                          error.message.toLowerCase().includes('exists') ||
+                          error.code === 'email_exists'
+      res.status(isDuplicate ? 409 : 400).json({
+        error: isDuplicate
+          ? 'An account with this email already exists.'
+          : 'Account creation failed. Please try again.',
+      })
       return
     }
 
@@ -46,6 +54,8 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
     })
 
     if (error || !data.session) {
+      // Phase 1.3: Constant-time response to prevent email enumeration via timing
+      await new Promise(r => setTimeout(r, 200 + Math.random() * 100))
       res.status(401).json({ error: 'Invalid email or password' })
       return
     }
