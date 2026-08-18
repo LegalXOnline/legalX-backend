@@ -10,6 +10,12 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET!,
 })
 
+// ── GET /api/webhooks/agora ───────────────────────────────────────────────────
+// Agora Health Check — sends GET to verify endpoint is alive. Must return 200.
+router.get('/agora', (_req: Request, res: Response) => {
+  res.json({ ok: true, service: 'legalx-agora-webhook' })
+})
+
 // ── POST /api/webhooks/agora ──────────────────────────────────────────────────
 // Called by Agora Message Notification Service when a channel event fires.
 // Security: Agora signs the payload with HMAC-SHA256 using AGORA_WEBHOOK_SECRET.
