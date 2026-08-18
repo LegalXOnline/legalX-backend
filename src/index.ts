@@ -162,6 +162,7 @@ app.get('/health', async (_req, res) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Webhook routes — NO CSRF, NO auth middleware. Security via HMAC signature only.
+// Agora Message Notification Service → POST /api/webhooks/agora
 app.use('/api/webhooks', webhooksRouter)
 
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
