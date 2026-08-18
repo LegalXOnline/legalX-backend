@@ -78,3 +78,53 @@ router.get('/:slug', async (req: Request, res: Response, next: NextFunction) => 
 })
 
 export default router
+
+// ── PATCH /api/lawyers/me/status ─────────────────────────────────────────────
+// Lawyer toggles their online/offline status. Requires auth + lawyer role.
+router.patch('/me/status', async (req: Request, res: Response) => {
+  try {
+    // Auth: cookie or Bearer token
+    const token =
+      req.cookies?.lx_access_token ||
+      req.headers.authorization?.replace('Bearer ', '')
+
+    if (!token) {
+      res.status(401).json({ error: 'Not authenticated' })
+      return
+    }
+
+    const { data: authData, error: authError } = await supabase.auth.getUser(token)
+    if (authError || !authData.user) {
+      res.status(401).json({ error: 'Session expired or invalid' })
+      return
+    }
+
+    const user = authData.user
+    if (user.user_metadata?.role !== 'lawyer') {
+      res.status(403).json({ error: 'Only lawyers can update availability status' })
+      return
+    }
+
+    // Validate body
+    const { isOnline } = req.body
+    if (typeof isOnline !== 'boolean') {
+      res.status(400).json({ error: 'isOnline must be a boolean' })
+      return
+    }
+
+    // Update lawyer_profiles
+    const { error: updateError } = await supabase
+      .from('lawyer_profiles')
+      .update({ is_online: isOnline, last_seen_at: new Date().toISOString() })
+      .eq('account_id', user.id)
+
+    if (updateError) {
+      res.status(500).json({ error: 'Failed to update status' })
+      return
+    }
+
+    res.json({ isOnline, message: `Status set to ${isOnline ? 'online' : 'offline'}` })
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
