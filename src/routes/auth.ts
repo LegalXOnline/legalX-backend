@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase, supabaseAuth } from '../lib/supabase'
-import { sendWelcomeEmail } from '../lib/email'
+import { sendWelcomeEmail, sendLawyerApplicationEmail } from '../lib/email'
 import { validateBody, authSignupSchema, authLoginSchema } from '../lib/validation'
 
 import { rateLimit } from 'express-rate-limit'
@@ -36,6 +36,15 @@ router.post('/signup', validateBody(authSignupSchema), async (req: Request, res:
     // Send our custom welcome email via Resend
     if (data.user?.email) {
       await sendWelcomeEmail(data.user.email, firstName, role)
+    }
+
+    // If registering as a lawyer: notify admin + send lawyer "pending review" email
+    if (role === 'lawyer' && data.user?.email) {
+      await sendLawyerApplicationEmail({
+        lawyerEmail: data.user.email,
+        lawyerFirstName: firstName,
+        lawyerLastName: lastName,
+      })
     }
 
     res.status(201).json({ message: 'Account created. Please sign in.' })
