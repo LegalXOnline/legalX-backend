@@ -98,9 +98,25 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
 })
 
 // ── POST /api/auth/logout ─────────────────────────────────────────────────────
-router.post('/logout', (_req: Request, res: Response) => {
-  res.clearCookie('lx_access_token', { path: '/' })
-  res.clearCookie('lx_refresh_token', { path: '/' })
+// Signs out from Supabase server-side (invalidates JWT) AND clears cookies.
+router.post('/logout', async (req: Request, res: Response) => {
+  const token =
+    req.cookies?.lx_access_token ||
+    req.headers.authorization?.replace('Bearer ', '')
+
+  // Best-effort Supabase signOut — invalidates JWT server-side
+  if (token) {
+    await supabase.auth.admin.signOut(token).catch(() => {})
+  }
+
+  const isProduction = process.env.NODE_ENV === 'production'
+  res.clearCookie('lx_access_token', {
+    httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', path: '/',
+  })
+  res.clearCookie('lx_refresh_token', {
+    httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', path: '/',
+  })
+  res.clearCookie('csrf_secret', { httpOnly: true, path: '/' })
   res.json({ message: 'Logged out' })
 })
 

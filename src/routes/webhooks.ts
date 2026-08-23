@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import crypto from 'crypto'
 import Razorpay from 'razorpay'
 import { supabase } from '../lib/supabase'
+import { logger } from '../lib/logger'
 
 const router = Router()
 
@@ -26,7 +27,7 @@ router.post('/agora', async (req: Request, res: Response) => {
   try {
     const webhookSecret = process.env.AGORA_WEBHOOK_SECRET
     if (!webhookSecret) {
-      console.error('[webhook/agora] AGORA_WEBHOOK_SECRET not configured')
+      logger.error({}, '[webhook/agora] AGORA_WEBHOOK_SECRET not configured')
       res.status(500).json({ error: 'Webhook not configured' })
       return
     }
@@ -46,7 +47,7 @@ router.post('/agora', async (req: Request, res: Response) => {
       const sigBuf = Buffer.from(sigV2.padEnd(expected.length, '\x00'))
       const expBuf = Buffer.from(expected)
       if (sigV2.length !== expected.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-        console.warn('[webhook/agora] Invalid v2 signature')
+        logger.warn({},  '[webhook/agora] Invalid v2 signature')
         res.status(401).json({ error: 'Invalid signature' }); return
       }
     } else if (sigV1) {
@@ -55,23 +56,23 @@ router.post('/agora', async (req: Request, res: Response) => {
       const sigBuf = Buffer.from(sigV1.padEnd(expected.length, '\x00'))
       const expBuf = Buffer.from(expected)
       if (sigV1.length !== expected.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-        console.warn('[webhook/agora] Invalid v1 signature')
+        logger.warn({},  '[webhook/agora] Invalid v1 signature')
         res.status(401).json({ error: 'Invalid signature' }); return
       }
     } else {
       // No signature — health check ping or unknown request
       // Agora health check POST has no signature body; return 200 to pass the check
-      console.info('[webhook/agora] No signature — treating as health check ping')
+      logger.info({},  '[webhook/agora] No signature — treating as health check ping')
       res.json({ ok: true }); return
     }
 
     // ── Process event ─────────────────────────────────────────────────────────
     const event = req.body
-    console.info('[webhook/agora] Event:', event.eventType, event.payload?.channelName)
+    logger.info({},  '[webhook/agora] Event:', event.eventType, event.payload?.channelName)
 
-    // Agora event types:
-    // 103 = channel create, 104 = channel destroy (all users left)
-    // 111 = broadcaster join, 112 = broadcaster leave
+    // Agora RTC Channel event types:
+    // 101 = channel create, 102 = channel destroy (all users left)
+    // 103 = broadcaster join, 104 = broadcaster leave
     if (event.eventType !== 102) { // 102 = channel destroy (all users left)
       // Not a channel destroy event — acknowledge and ignore
       res.json({ received: true })
@@ -94,14 +95,14 @@ router.post('/agora', async (req: Request, res: Response) => {
       .single()
 
     if (findErr || !consultation) {
-      console.warn('[webhook/agora] No consultation found for channel:', channelName)
+      logger.warn({},  '[webhook/agora] No consultation found for channel:', channelName)
       res.json({ received: true })
       return
     }
 
     // ── Idempotency guard ─────────────────────────────────────────────────────
     if (consultation.payment_status === 'paid' || consultation.status === 'completed') {
-      console.info('[webhook/agora] Already processed — skip:', consultation.id)
+      logger.info({},  '[webhook/agora] Already processed — skip:', consultation.id)
       res.json({ received: true, skipped: true })
       return
     }
@@ -133,14 +134,14 @@ router.post('/agora', async (req: Request, res: Response) => {
           'INR',
         )
         paymentCaptured = true
-        console.info('[webhook/agora] Payment captured:', {
+        logger.info({},  '[webhook/agora] Payment captured:', {
           consultationId: consultation.id,
           paymentId: consultation.razorpay_payment_id,
           totalAmountPaise,
           durationSeconds,
         })
       } catch (rpErr: any) {
-        console.error('[webhook/agora] Razorpay capture failed:', rpErr?.error ?? rpErr)
+        logger.error({}, '[webhook/agora] Razorpay capture failed:', rpErr?.error ?? rpErr)
         await supabase.from('consultations').update({
           status: 'completed',
           payment_status: 'failed',
@@ -162,7 +163,7 @@ router.post('/agora', async (req: Request, res: Response) => {
       total_amount: totalAmount,
     }).eq('id', consultation.id)
 
-    console.info('[webhook/agora] Consultation completed:', {
+    logger.info({},  '[webhook/agora] Consultation completed:', {
       consultationId: consultation.id,
       durationSeconds,
       totalAmount,
@@ -171,7 +172,7 @@ router.post('/agora', async (req: Request, res: Response) => {
 
     res.json({ received: true, consultationId: consultation.id, durationSeconds, totalAmount, paymentCaptured })
   } catch (err) {
-    console.error('[webhook/agora] Unhandled error:', err)
+    logger.error({}, '[webhook/agora] Unhandled error:', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })
