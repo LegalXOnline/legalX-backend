@@ -139,3 +139,112 @@ export async function sendWelcomeEmail(to: string, name: string, role: string) {
     console.error('[email] welcome email failed:', err)
   }
 }
+
+// ── Notify admin + lawyer when a new lawyer registers (pending verification) ──
+// Admin gets an alert to review and verify the lawyer.
+// Lawyer gets a "we received your application" email.
+export async function sendLawyerApplicationEmail(opts: {
+  lawyerEmail: string
+  lawyerFirstName: string
+  lawyerLastName: string
+}) {
+  const name = `${opts.lawyerFirstName} ${opts.lawyerLastName}`.trim()
+
+  // 1. Alert admin at domain email (contact@legalxonline.com)
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `New Lawyer Application: ${name} — Pending Verification`,
+      html: `
+        <div style="font-family:sans-serif;max-width:540px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 16px;color:#111;border-bottom:2px solid #C9A227;padding-bottom:12px">
+            New Lawyer Application
+          </h2>
+          <table style="width:100%;border-collapse:collapse">
+            <tr>
+              <td style="padding:8px 0;color:#555;width:140px;font-size:14px">Name</td>
+              <td style="padding:8px 0;font-weight:600;color:#111;font-size:14px">${name}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:#555;font-size:14px">Email</td>
+              <td style="padding:8px 0;color:#111;font-size:14px">
+                <a href="mailto:${opts.lawyerEmail}" style="color:#C9A227">${opts.lawyerEmail}</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:#555;font-size:14px">Status</td>
+              <td style="padding:8px 0;font-size:14px">
+                <span style="background:#FFF3CD;color:#856404;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">
+                  PENDING VERIFICATION
+                </span>
+              </td>
+            </tr>
+          </table>
+          <div style="margin-top:24px;padding:16px;background:#fafafa;border-left:4px solid #C9A227;border-radius:4px">
+            <p style="margin:0;color:#333;font-size:14px">
+              Please log in to the <strong>LegalX Admin Panel</strong> to review this application,
+              verify bar council credentials, and approve or reject the lawyer's account.
+            </p>
+          </div>
+          <p style="margin:20px 0 0;color:#888;font-size:12px">
+            Received at ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] lawyer admin alert failed:', err)
+  }
+
+  // 2. Send "application received" email to the lawyer
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: opts.lawyerEmail,
+      subject: `Your LegalX Lawyer Application Has Been Received`,
+      html: `
+        <div style="font-family:sans-serif;max-width:540px;margin:0 auto;padding:24px">
+          <div style="text-align:center;margin-bottom:24px">
+            <h1 style="font-size:28px;font-weight:800;color:#111;letter-spacing:-0.5px;margin:0">
+              Legal<span style="color:#C9A227">X</span>
+            </h1>
+            <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
+          </div>
+
+          <h2 style="margin:0 0 12px;color:#111">Application Received, ${opts.lawyerFirstName}!</h2>
+
+          <p style="color:#555;line-height:1.7;font-size:15px">
+            Thank you for applying to join <strong>LegalX</strong> as a verified lawyer.
+            We have received your application and our team is reviewing your credentials.
+          </p>
+
+          <div style="margin:24px 0;padding:20px;background:#F8F9FA;border-radius:8px;border:1px solid #E9ECEF">
+            <h3 style="margin:0 0 12px;color:#333;font-size:14px;text-transform:uppercase;letter-spacing:0.5px">
+              What Happens Next
+            </h3>
+            <ol style="margin:0;padding-left:20px;color:#555;font-size:14px;line-height:1.8">
+              <li>Our team verifies your Bar Council registration</li>
+              <li>We may reach out for additional documents if needed</li>
+              <li>Once verified, your profile will be live on the platform</li>
+              <li>You'll receive a confirmation email with login instructions</li>
+            </ol>
+          </div>
+
+          <p style="color:#555;line-height:1.7;font-size:14px">
+            This process typically takes <strong>1–2 business days</strong>.
+            If you have any questions, reply to this email or contact us at
+            <a href="mailto:contact@legalxonline.com" style="color:#C9A227;text-decoration:none">contact@legalxonline.com</a>.
+          </p>
+
+          <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE;color:#999;font-size:12px;text-align:center">
+            LegalXOnline · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222<br/>
+            <a href="https://legalxonline.com" style="color:#C9A227;text-decoration:none">legalxonline.com</a>
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] lawyer confirmation email failed:', err)
+  }
+}
