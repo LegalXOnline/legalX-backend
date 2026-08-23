@@ -54,7 +54,10 @@ app.use((req, res, next) => {
 })
 
 // Parse cookies before CSRF middleware reads req.signedCookies
-app.use(cookieParser(process.env.COOKIE_SECRET || 'lx_cookie_secret_change_in_prod'))
+if (!process.env.COOKIE_SECRET && process.env.NODE_ENV === 'production') {
+  throw new Error('COOKIE_SECRET env var is required in production')
+}
+app.use(cookieParser(process.env.COOKIE_SECRET || 'lx_dev_cookie_secret_only'))
 
 // ── CSRF Protection ──────────────────────────────────────────────────────────────
 const csrfProtection = new csrf()
