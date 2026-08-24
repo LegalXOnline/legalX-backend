@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase, supabaseAuth } from '../lib/supabase'
-import { sendWelcomeEmail, sendLawyerApplicationEmail } from '../lib/email'
+import { sendWelcomeEmail, sendLawyerOnboardingWelcome } from '../lib/email'
 import { validateBody, authSignupSchema, authLoginSchema } from '../lib/validation'
 
 import { rateLimit } from 'express-rate-limit'
@@ -33,18 +33,44 @@ router.post('/signup', validateBody(authSignupSchema), async (req: Request, res:
       return
     }
 
-    // Send our custom welcome email via Resend
-    if (data.user?.email) {
-      await sendWelcomeEmail(data.user.email, firstName, role)
+    // ── Insert into public.accounts (service role bypasses RLS) ────────────────
+    // Supabase admin.createUser creates the row in auth.users but NOT in public.accounts.
+    // We must do this manually with the service-role client.
+    if (data.user) {
+      const { error: insertError } = await supabase
+        .from('accounts')
+        .insert({
+          id:         data.user.id,
+          email:      email.toLowerCase().trim(),
+          first_name: firstName,
+          last_name:  lastName,
+          role:       role as 'client' | 'lawyer' | 'admin',
+          status:     'active',
+        })
+      if (insertError) {
+        // Roll back: delete the auth user so they aren't orphaned
+        await supabase.auth.admin.deleteUser(data.user.id).catch(() => {})
+        res.status(500).json({ error: 'Account setup failed. Please try again.' })
+        return
+      }
+
+      // If lawyer: create an empty lawyer_profiles row so onboarding can UPSERT into it
+      if (role === 'lawyer') {
+        try {
+        await supabase.from('lawyer_profiles').insert({ account_id: data.user.id })
+      } catch { /* non-fatal — onboarding POST will upsert anyway */ }
+      }
     }
 
-    // If registering as a lawyer: notify admin + send lawyer "pending review" email
-    if (role === 'lawyer' && data.user?.email) {
-      await sendLawyerApplicationEmail({
-        lawyerEmail: data.user.email,
-        lawyerFirstName: firstName,
-        lawyerLastName: lastName,
-      })
+    // Send welcome email — only the "account created, complete your profile" email for lawyers
+    // The admin notification + confirmation email fires when lawyer submits the onboarding form
+    if (data.user?.email) {
+      if (role === 'lawyer') {
+        // Non-blocking: send onboarding welcome (not a "submitted" email)
+        sendLawyerOnboardingWelcome(data.user.email, firstName).catch(console.error)
+      } else {
+        sendWelcomeEmail(data.user.email, firstName, role).catch(console.error)
+      }
     }
 
     res.status(201).json({ message: 'Account created. Please sign in.' })
@@ -92,13 +118,32 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
       path: '/',
     })
 
+    // Always read role from public.accounts (source of truth), not user_metadata
+    // This ensures manually promoted admins get the correct role immediately
+    const { data: account } = await supabase
+      .from('accounts')
+      .select('role, first_name, last_name, status')
+      .eq('id', user.id)
+      .single()
+
+    // Guard: if no accounts row yet (shouldn't happen after fix, but just in case)
+    if (!account) {
+      res.status(403).json({ error: 'Account not found. Please contact support.' })
+      return
+    }
+
+    if (account.status === 'suspended') {
+      res.status(403).json({ error: 'This account has been suspended. Please contact support.' })
+      return
+    }
+
     res.json({
       user: {
         id: user.id,
         email: user.email,
-        firstName: user.user_metadata?.first_name ?? '',
-        lastName: user.user_metadata?.last_name ?? '',
-        role: user.user_metadata?.role ?? 'client',
+        firstName: account.first_name ?? user.user_metadata?.first_name ?? '',
+        lastName:  account.last_name  ?? user.user_metadata?.last_name  ?? '',
+        role:      account.role,        // from accounts table — the real source of truth
       },
     })
   } catch (err) {
@@ -150,13 +195,31 @@ router.get('/me', async (req: Request, res: Response) => {
     }
 
     const u = data.user
+
+    // Read role from accounts table — single source of truth
+    const { data: account } = await supabase
+      .from('accounts')
+      .select('role, first_name, last_name, status')
+      .eq('id', u.id)
+      .single()
+
+    if (!account) {
+      res.status(401).json({ error: 'Account not found' })
+      return
+    }
+
+    if (account.status === 'suspended') {
+      res.status(403).json({ error: 'Account suspended' })
+      return
+    }
+
     res.json({
       user: {
         id: u.id,
         email: u.email,
-        firstName: u.user_metadata?.first_name ?? '',
-        lastName: u.user_metadata?.last_name ?? '',
-        role: u.user_metadata?.role ?? 'client',
+        firstName: account.first_name ?? u.user_metadata?.first_name ?? '',
+        lastName:  account.last_name  ?? u.user_metadata?.last_name  ?? '',
+        role:      account.role,
       },
     })
   } catch {

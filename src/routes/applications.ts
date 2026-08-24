@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase } from '../lib/supabase'
 import { validateBody, validateParams, applicationCreateSchema, applicationIdParamSchema } from '../lib/validation'
+import { sendDocumentsSubmittedAlert } from '../lib/email'
 
 const router = Router()
 
@@ -10,10 +11,10 @@ router.post('/', validateBody(applicationCreateSchema), async (req: Request, res
   try {
     const { leadId, serviceSlug, formData } = req.body
 
-    // Verify leadId exists
+    // Verify leadId exists and fetch details for email notification in one query
     const { data: lead, error: leadError } = await supabase
       .from('leads')
-      .select('id')
+      .select('id, name, phone, email, service_title')
       .eq('id', leadId)
       .single()
 
@@ -37,6 +38,17 @@ router.post('/', validateBody(applicationCreateSchema), async (req: Request, res
 
     // Mark lead as progressed
     await supabase.from('leads').update({ status: 'contacted' }).eq('id', leadId)
+
+    // Non-blocking: alert admin that documents were submitted but payment not yet done
+    if (lead) {
+      sendDocumentsSubmittedAlert({
+        name: lead.name,
+        phone: lead.phone,
+        email: lead.email,
+        serviceTitle: lead.service_title,
+        applicationId: data.id,
+      }).catch(() => {}) // fire-and-forget
+    }
 
     return res.status(201).json({ applicationId: data.id })
   } catch (err) {

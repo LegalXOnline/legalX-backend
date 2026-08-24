@@ -248,3 +248,330 @@ export async function sendLawyerApplicationEmail(opts: {
     console.error('[email] lawyer confirmation email failed:', err)
   }
 }
+
+// ── Alert admin when documents are submitted but payment not yet made ─────────
+// Fires immediately after POST /api/applications completes.
+// A second "Payment Received" email fires after POST /api/payment/verify succeeds.
+export async function sendDocumentsSubmittedAlert(opts: {
+  name: string
+  phone: string
+  email?: string
+  serviceTitle: string
+  applicationId: string
+}) {
+  const shortId = opts.applicationId.slice(0, 8).toUpperCase()
+  const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `📋 Documents Submitted (Awaiting Payment): ${opts.name} — ${opts.serviceTitle}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 6px;color:#111;font-size:20px">
+            📋 Documents Submitted — Awaiting Payment
+          </h2>
+          <p style="margin:0 0 20px;color:#888;font-size:13px">
+            Application Ref: <code style="background:#f4f4f4;padding:2px 6px;border-radius:4px;font-weight:600">${shortId}</code>
+          </p>
+
+          <div style="background:#FFF9E6;border:1px solid #F5D76E;border-radius:8px;padding:16px 20px;margin-bottom:20px">
+            <p style="margin:0;color:#856404;font-size:14px;font-weight:600">
+              ⚠️ Payment has NOT been received yet. Do not begin processing until payment is confirmed.
+            </p>
+          </div>
+
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666;width:130px">Client Name</td>
+              <td style="padding:10px 0;font-weight:600;color:#111">${opts.name}</td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Phone</td>
+              <td style="padding:10px 0;color:#111"><a href="tel:${opts.phone}" style="color:#C9A227;text-decoration:none">${opts.phone}</a></td>
+            </tr>
+            ${opts.email ? `
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Email</td>
+              <td style="padding:10px 0;color:#111"><a href="mailto:${opts.email}" style="color:#C9A227;text-decoration:none">${opts.email}</a></td>
+            </tr>` : ''}
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Service</td>
+              <td style="padding:10px 0;font-weight:600;color:#C9A227">${opts.serviceTitle}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#666">Status</td>
+              <td style="padding:10px 0">
+                <span style="background:#FFF3CD;color:#856404;padding:3px 10px;border-radius:20px;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:0.5px">
+                  Awaiting Payment
+                </span>
+              </td>
+            </tr>
+          </table>
+
+          <div style="margin-top:24px;padding:16px;background:#fafafa;border-radius:8px;border-left:4px solid #C9A227">
+            <p style="margin:0;color:#333;font-size:13px;line-height:1.6">
+              Documents have been uploaded and saved. You will receive a second email
+              <strong>"Payment Received"</strong> once the client completes payment via Razorpay.
+            </p>
+          </div>
+
+          <p style="margin:20px 0 0;color:#aaa;font-size:12px">Submitted at ${timestamp} IST</p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] documents-submitted alert failed:', err)
+  }
+}
+
+// ── Lawyer: onboarding welcome (sent at signup) ───────────────────────────────
+export async function sendLawyerOnboardingWelcome(email: string, firstName: string) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'Complete Your Lawyer Profile — LegalXOnline',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Welcome, ${firstName}</h2>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 20px">
+            Your LegalX lawyer account has been created. To go live and receive client consultations,
+            you need to complete your professional profile and submit your Bar Council credentials for verification.
+          </p>
+          <div style="background:#F9F6EF;border-left:4px solid #C9A227;padding:16px 20px;border-radius:4px;margin-bottom:24px">
+            <p style="margin:0;color:#7A6010;font-size:14px;font-weight:600">
+              Your profile will not be visible to clients until verification is complete.
+            </p>
+          </div>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 16px">
+            Please keep the following documents ready before starting:
+          </p>
+          <ul style="color:#333;font-size:14px;line-height:2;padding-left:20px;margin:0 0 24px">
+            <li>Bar Council Enrolment Certificate</li>
+            <li>Bar Council ID Card (front and back)</li>
+            <li>Government ID — PAN Card, Aadhaar Card, or Passport</li>
+            <li>Professional photo (headshot)</li>
+            <li>Bank account details for consultation payouts</li>
+          </ul>
+          <a href="https://legalxonline.com/onboarding/lawyer"
+             style="display:inline-block;background:#C9A227;color:#fff;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">
+            Complete My Profile
+          </a>
+          <p style="color:#aaa;font-size:12px;margin-top:32px">
+            If you did not create this account, please ignore this email or contact
+            <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>.
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerOnboardingWelcome failed:', err)
+  }
+}
+
+// ── Lawyer: documents submitted — admin notification with signed URLs ──────────
+export async function sendLawyerDocsSubmittedAdmin(opts: {
+  name: string
+  email: string
+  barState: string
+  barNumber: string
+  enrolmentYear: string | number
+  signedUrls: Record<string, string>
+  lawyerId: string
+}) {
+  const docRows = Object.entries(opts.signedUrls)
+    .map(([key, url]) => {
+      const labels: Record<string, string> = {
+        enrolment_cert: 'Enrolment Certificate',
+        bar_id_front:   'Bar ID Card — Front',
+        bar_id_back:    'Bar ID Card — Back',
+        govt_id:        'Government ID',
+        profile_photo:  'Profile Photo',
+      }
+      return `
+        <tr style="border-bottom:1px solid #EEE">
+          <td style="padding:10px 0;color:#666;width:200px;font-size:14px">${labels[key] ?? key}</td>
+          <td style="padding:10px 0;font-size:14px">
+            <a href="${url}" style="color:#C9A227;text-decoration:none;font-weight:600" target="_blank">
+              View Document
+            </a>
+            <span style="color:#aaa;font-size:11px;margin-left:8px">(expires 24h)</span>
+          </td>
+        </tr>`
+    }).join('')
+
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `Lawyer Verification Required: ${opts.name} — ${opts.barState}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 6px;color:#111;font-size:20px">New Lawyer Application — Action Required</h2>
+          <p style="color:#888;font-size:13px;margin:0 0 24px">
+            Lawyer ID: <code style="background:#f4f4f4;padding:2px 6px;border-radius:4px">${opts.lawyerId}</code>
+          </p>
+
+          <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:24px">
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666;width:200px">Full Name</td>
+              <td style="padding:10px 0;font-weight:600;color:#111">${opts.name}</td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Email</td>
+              <td style="padding:10px 0;color:#111">
+                <a href="mailto:${opts.email}" style="color:#C9A227">${opts.email}</a>
+              </td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Bar Council</td>
+              <td style="padding:10px 0;font-weight:600;color:#111">${opts.barState}</td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Enrolment Number</td>
+              <td style="padding:10px 0;font-weight:600;color:#111">${opts.barNumber}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 0;color:#666">Year of Enrolment</td>
+              <td style="padding:10px 0;color:#111">${opts.enrolmentYear}</td>
+            </tr>
+          </table>
+
+          <h3 style="font-size:15px;color:#111;margin:0 0 12px">Submitted Documents</h3>
+          <table style="width:100%;border-collapse:collapse">
+            ${docRows || '<tr><td style="color:#888;font-size:14px;padding:10px 0">No documents attached</td></tr>'}
+          </table>
+
+          <div style="margin-top:28px;padding:16px 20px;background:#fafafa;border-radius:8px;border-left:4px solid #C9A227">
+            <p style="margin:0;color:#333;font-size:13px;line-height:1.6">
+              Verify the enrolment number against the official
+              <a href="https://www.barcouncilofindia.org" style="color:#C9A227" target="_blank">
+                Bar Council of India portal
+              </a>, then approve or reject from the admin panel.
+            </p>
+          </div>
+
+          <div style="margin-top:20px;display:flex;gap:12px">
+            <a href="https://legalxonline.com/admin"
+               style="display:inline-block;background:#111;color:#fff;font-weight:700;padding:11px 24px;border-radius:8px;text-decoration:none;font-size:13px">
+              Go to Admin Panel
+            </a>
+          </div>
+
+          <p style="color:#aaa;font-size:11px;margin-top:24px">
+            Sent at ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerDocsSubmittedAdmin failed:', err)
+  }
+}
+
+// ── Lawyer: confirmation that documents are received ─────────────────────────
+export async function sendLawyerDocsReceivedConfirmation(email: string, firstName: string) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'Documents Received — Under Review | LegalXOnline',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Documents Received, ${firstName}</h2>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 20px">
+            We have received your profile and credential documents. Our team will verify your
+            Bar Council registration and get back to you within 2–3 business days.
+          </p>
+          <div style="background:#F0FDF4;border-left:4px solid #22C55E;padding:16px 20px;border-radius:4px;margin-bottom:24px">
+            <p style="margin:0;color:#166534;font-size:14px">
+              You will receive an email as soon as your profile is approved or if we need additional information.
+            </p>
+          </div>
+          <p style="color:#555;font-size:14px;line-height:1.6">
+            In the meantime, you can log in to check your verification status at any time.
+          </p>
+          <a href="https://legalxonline.com/lawyer-dashboard"
+             style="display:inline-block;background:#C9A227;color:#fff;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px;margin-top:16px">
+            View My Dashboard
+          </a>
+          <p style="color:#aaa;font-size:12px;margin-top:32px">
+            Questions? Contact us at
+            <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerDocsReceivedConfirmation failed:', err)
+  }
+}
+
+// ── Lawyer: approved ──────────────────────────────────────────────────────────
+export async function sendLawyerApproved(email: string, firstName: string) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'Profile Approved — You Are Now Live on LegalXOnline',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Profile Approved, ${firstName}</h2>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 20px">
+            Your LegalX lawyer profile has been verified and is now live. Clients can find and book
+            consultations with you from the LegalX platform.
+          </p>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 24px">
+            Log in to your dashboard to set your availability and start accepting consultations.
+          </p>
+          <a href="https://legalxonline.com/lawyer-dashboard"
+             style="display:inline-block;background:#C9A227;color:#fff;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">
+            Go to My Dashboard
+          </a>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerApproved failed:', err)
+  }
+}
+
+// ── Lawyer: rejected ──────────────────────────────────────────────────────────
+export async function sendLawyerRejected(email: string, firstName: string, reason: string) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'Update on Your LegalX Lawyer Application',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Application Update, ${firstName}</h2>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 20px">
+            After reviewing your submitted documents, we were unable to verify your credentials at this time.
+          </p>
+          <div style="background:#FFF5F5;border-left:4px solid #EF4444;padding:16px 20px;border-radius:4px;margin-bottom:24px">
+            <p style="margin:0 0 6px;color:#7F1D1D;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">
+              Reason
+            </p>
+            <p style="margin:0;color:#991B1B;font-size:14px;line-height:1.6">${reason}</p>
+          </div>
+          <p style="color:#555;font-size:14px;line-height:1.6;margin:0 0 20px">
+            You may resubmit your application with corrected documents. Log in to update your profile.
+          </p>
+          <a href="https://legalxonline.com/onboarding/lawyer"
+             style="display:inline-block;background:#111;color:#fff;font-weight:700;padding:12px 28px;border-radius:8px;text-decoration:none;font-size:14px">
+            Resubmit Application
+          </a>
+          <p style="color:#aaa;font-size:12px;margin-top:32px">
+            If you believe this is an error, contact us at
+            <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerRejected failed:', err)
+  }
+}
