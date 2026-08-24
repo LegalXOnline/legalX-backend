@@ -21,6 +21,13 @@ router.post('/signup', validateBody(authSignupSchema), async (req: Request, res:
     })
 
     if (error) {
+      // Log the exact error to Render console so we can debug why it's failing
+      console.error('[SIGNUP ERROR] supabase.auth.admin.createUser failed:', {
+        message: error.message,
+        name: error.name,
+        status: error.status,
+      })
+
       // Phase 1.3: Never leak raw Supabase error text — normalize to safe messages
       const isDuplicate = error.message.toLowerCase().includes('already') ||
                           error.message.toLowerCase().includes('exists') ||
