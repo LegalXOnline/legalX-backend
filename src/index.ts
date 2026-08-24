@@ -17,6 +17,7 @@ import adminRouter from './routes/admin'
 import consultationsRouter from './routes/consultations'
 import webhooksRouter from './routes/webhooks'
 import notificationsRouter from './routes/notifications'
+import uploadRouter from './routes/upload'
 
 // Extend Express Request type
 declare global {
@@ -117,8 +118,14 @@ app.use(cors({
   origin: (origin, cb) => {
     // allow curl / server-side calls (no origin header)
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true)
-    // Allow any vercel.app or netlify.app subdomain in production for preview deployments
-    if (process.env.NODE_ENV === 'production' && (origin.endsWith('.vercel.app') || origin.endsWith('.netlify.app'))) {
+    // Allow vercel, netlify, and legalxonline domains in production
+    if (process.env.NODE_ENV === 'production' && (
+      origin.endsWith('.vercel.app') || 
+      origin.endsWith('.netlify.app') ||
+      origin === 'https://legalxonline.com' ||
+      origin === 'https://www.legalxonline.com' ||
+      origin.endsWith('.legalxonline.com')
+    )) {
       return cb(null, true)
     }
     cb(new Error(`CORS: ${origin} not allowed`))
@@ -126,8 +133,24 @@ app.use(cors({
   credentials: true, // Required for cookies to be sent cross-origin
 }))
 
+// Trust the first proxy in production (Render load balancer sends X-Forwarded-For).
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+// In development there is no proxy, so we leave trust proxy off but tell
+// the rate-limiter to skip the X-Forwarded-For header validation.
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1) // trust Render's single-hop load balancer
+}
+
 // Global rate limit — 100 req / 15 min per IP
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true }))
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // In development (no proxy), suppress the X-Forwarded-For validation error.
+  // In production trust proxy is set above so this is already safe.
+  validate: { xForwardedForHeader: process.env.NODE_ENV === 'production' },
+}))
 
 
 app.use(express.json({ limit: '1mb' }))
@@ -167,6 +190,7 @@ app.get('/health', async (_req, res) => {
 // ── Routes ────────────────────────────────────────────────────────────────────
 // Webhook routes — NO CSRF, secured by HMAC signature
 app.use('/api/webhooks', webhooksRouter)
+app.use('/api/upload', validateCsrf, uploadRouter)
 
 // SSE notification stream — GET only, auth via cookie, no CSRF needed
 app.use('/api/notifications', notificationsRouter)

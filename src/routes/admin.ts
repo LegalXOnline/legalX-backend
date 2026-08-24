@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase } from '../lib/supabase'
 import { validateBody, validateParams, lawyerIdParamSchema, adminLawyerRejectBodySchema } from '../lib/validation'
+import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 
 const router = Router()
 
@@ -51,12 +52,25 @@ router.get('/lawyers', requireAdmin, async (req: Request, res: Response, next: N
 router.patch('/lawyers/:id/approve', requireAdmin, validateParams(lawyerIdParamSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params
+    // Fetch lawyer details for email
+    const { data: lawyer } = await supabase
+      .from('lawyer_profiles')
+      .select('email, first_name')
+      .eq('account_id', id)
+      .single()
+
     const { error } = await supabase
       .from('lawyer_profiles')
-      .update({ verification_status: 'verified', verified_at: new Date().toISOString() })
+      .update({ verification_status: 'verified', verified_at: new Date().toISOString(), updated_at: new Date().toISOString() })
       .eq('account_id', id)
 
     if (error) throw error
+
+    // Send approval email
+    if (lawyer?.email) {
+      sendLawyerApproved(lawyer.email, lawyer.first_name ?? 'Advocate').catch(console.error)
+    }
+
     res.json({ message: 'Lawyer approved successfully' })
   } catch (err) {
     next(err)
@@ -68,12 +82,25 @@ router.patch('/lawyers/:id/reject', requireAdmin, validateParams(lawyerIdParamSc
   try {
     const { id } = req.params
     const { reason } = req.body
+    // Fetch lawyer details for email
+    const { data: lawyer } = await supabase
+      .from('lawyer_profiles')
+      .select('email, first_name')
+      .eq('account_id', id)
+      .single()
+
     const { error } = await supabase
       .from('lawyer_profiles')
-      .update({ verification_status: 'rejected', rejection_reason: reason ?? null })
+      .update({ verification_status: 'rejected', rejection_reason: reason ?? null, updated_at: new Date().toISOString() })
       .eq('account_id', id)
 
     if (error) throw error
+
+    // Send rejection email with reason
+    if (lawyer?.email) {
+      sendLawyerRejected(lawyer.email, lawyer.first_name ?? 'Advocate', reason ?? 'Your documents could not be verified.').catch(console.error)
+    }
+
     res.json({ message: 'Lawyer application rejected' })
   } catch (err) {
     next(err)
@@ -91,6 +118,47 @@ router.get('/stats', requireAdmin, async (_req: Request, res: Response, next: Ne
     res.json({
       verifiedLawyers: lawyersRes.count ?? 0,
       pendingApprovals: pendingRes.count ?? 0,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+
+// ── GET /api/admin/lawyers/:id/docs ──────────────────────────────────────────
+// Returns 24-hour signed URLs for all submitted documents.
+// Admin uses this to view documents without direct Supabase Storage access.
+router.get('/lawyers/:id/docs', requireAdmin, validateParams(lawyerIdParamSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params
+    const { data: lawyer, error } = await supabase
+      .from('lawyer_profiles')
+      .select('enrolment_cert_url, bar_id_front_url, bar_id_back_url, govt_id_url, profile_photo_url, govt_id_type, first_name, last_name, email')
+      .eq('account_id', id)
+      .single()
+
+    if (error || !lawyer) return res.status(404).json({ error: 'Lawyer not found' })
+
+    const docFields: Record<string, string | null> = {
+      enrolment_cert: lawyer.enrolment_cert_url,
+      bar_id_front:   lawyer.bar_id_front_url,
+      bar_id_back:    lawyer.bar_id_back_url,
+      govt_id:        lawyer.govt_id_url,
+      profile_photo:  lawyer.profile_photo_url,
+    }
+
+    const signedDocs: Record<string, string | null> = {}
+    for (const [key, path] of Object.entries(docFields)) {
+      if (!path) { signedDocs[key] = null; continue }
+      const { data } = await supabase.storage
+        .from('legalx-lawyer-docs')
+        .createSignedUrl(path, 86400)
+      signedDocs[key] = data?.signedUrl ?? null
+    }
+
+    return res.json({
+      lawyer: { name: `${lawyer.first_name} ${lawyer.last_name}`, email: lawyer.email, govtIdType: lawyer.govt_id_type },
+      docs: signedDocs,
     })
   } catch (err) {
     next(err)
