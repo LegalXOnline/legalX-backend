@@ -33,34 +33,8 @@ router.post('/signup', validateBody(authSignupSchema), async (req: Request, res:
       return
     }
 
-    // ── Insert into public.accounts (service role bypasses RLS) ────────────────
-    // Supabase admin.createUser creates the row in auth.users but NOT in public.accounts.
-    // We must do this manually with the service-role client.
-    if (data.user) {
-      const { error: insertError } = await supabase
-        .from('accounts')
-        .insert({
-          id:         data.user.id,
-          email:      email.toLowerCase().trim(),
-          first_name: firstName,
-          last_name:  lastName,
-          role:       role as 'client' | 'lawyer' | 'admin',
-          status:     'active',
-        })
-      if (insertError) {
-        // Roll back: delete the auth user so they aren't orphaned
-        await supabase.auth.admin.deleteUser(data.user.id).catch(() => {})
-        res.status(500).json({ error: 'Account setup failed. Please try again.' })
-        return
-      }
-
-      // If lawyer: create an empty lawyer_profiles row so onboarding can UPSERT into it
-      if (role === 'lawyer') {
-        try {
-        await supabase.from('lawyer_profiles').insert({ account_id: data.user.id })
-      } catch { /* non-fatal — onboarding POST will upsert anyway */ }
-      }
-    }
+    // ── NOTE: Database trigger handles accounts & lawyer_profiles insertion ──────
+    // The handle_new_auth_user trigger fires automatically on admin.createUser
 
     // Send welcome email — only the "account created, complete your profile" email for lawyers
     // The admin notification + confirmation email fires when lawyer submits the onboarding form
