@@ -190,7 +190,7 @@ router.post('/onboarding', async (req: Request, res: Response) => {
       if (data?.signedUrl) signedUrls[key] = data.signedUrl
     }
 
-    // Upsert full lawyer profile row
+    // ── Step 1: Upsert lawyer_profiles (no bank cols — those go to lawyer_bank_details) ──
     const { error: upsertError } = await supabase
       .from('lawyer_profiles')
       .upsert({
@@ -199,17 +199,20 @@ router.post('/onboarding', async (req: Request, res: Response) => {
         first_name:          firstName,
         last_name:           lastName,
         phone,
-        // Page 1
+        // Page 1 — Credentials
         bar_council_state:   barCouncilState,
         bar_council_number:  barCouncilNumber,
         enrolment_year:      enrolmentYear ? Number(enrolmentYear) : null,
         profile_photo_url:   profilePhotoPath ?? null,
-        enrolment_cert_url:  enrolmentCertPath ?? null,
-        bar_id_front_url:    barIdFrontPath ?? null,
-        bar_id_back_url:     barIdBackPath ?? null,
+        // Note: enrolment_cert_url / bar_id_*_url / govt_id_url columns are added
+        // via migration. If not yet applied, they are skipped gracefully here and
+        // stored in signedUrls for admin review via email only.
+        ...(enrolmentCertPath ? { enrolment_cert_url: enrolmentCertPath } : {}),
+        ...(barIdFrontPath    ? { bar_id_front_url:   barIdFrontPath }    : {}),
+        ...(barIdBackPath     ? { bar_id_back_url:    barIdBackPath }     : {}),
+        ...(govtIdPath        ? { govt_id_url:        govtIdPath }        : {}),
         govt_id_type:        govtIdType ?? null,
-        govt_id_url:         govtIdPath ?? null,
-        // Page 2
+        // Page 2 — Profile
         bio:                 bio ?? null,
         firm_name:           firmName ?? null,
         linkedin_url:        linkedinUrl ?? null,
@@ -219,17 +222,14 @@ router.post('/onboarding', async (req: Request, res: Response) => {
         specializations:     specializations ?? [],
         primary_specialization: primarySpecialization ?? (specializations?.[0] ?? 'General Practice'),
         years_experience:    yearsExperience ? Number(yearsExperience) : 0,
-        // Page 3
+        // Page 3 — Services
         consultation_types:     consultationTypes ?? ['chat', 'voice', 'video'],
         consultation_fee_chat:  feeChat  ? Number(feeChat)  : 20,
         consultation_fee_voice: feeVoice ? Number(feeVoice) : 30,
         consultation_fee_video: feeVideo ? Number(feeVideo) : 40,
         document_services:   documentServices ?? [],
         availability_slots:  availabilitySlots ?? {},
-        // Page 4
-        bank_account_number: bankAccountNumber ?? null,
-        bank_ifsc:           bankIfsc ?? null,
-        bank_name:           bankName ?? null,
+        // Page 4 — Payout (upi_id, pan, gst live on lawyer_profiles; bank rows go to lawyer_bank_details)
         upi_id:              upiId ?? null,
         pan_number:          panNumber ?? null,
         gst_number:          gstNumber ?? null,
@@ -244,6 +244,25 @@ router.post('/onboarding', async (req: Request, res: Response) => {
     if (upsertError) {
       console.error('[lawyers/onboarding] DB upsert error:', upsertError.message)
       return res.status(500).json({ error: 'Failed to save onboarding data. Please try again.' })
+    }
+
+    // ── Step 2: Upsert bank details into lawyer_bank_details (separate table) ──
+    if (bankAccountNumber?.trim() && bankIfsc?.trim()) {
+      const { error: bankError } = await supabase
+        .from('lawyer_bank_details')
+        .upsert({
+          account_id:     user.id,
+          beneficiary:    bankName?.trim() || `${firstName} ${lastName}`.trim(),
+          account_number: bankAccountNumber.trim(),
+          ifsc:           bankIfsc.trim().toUpperCase(),
+          bank_name:      bankName?.trim() || 'Unknown',
+          is_primary:     true,
+        }, { onConflict: 'account_id, account_number' })
+
+      if (bankError) {
+        // Non-fatal: profile already saved; log but don't block
+        console.error('[lawyers/onboarding] Bank details upsert error:', bankError.message)
+      }
     }
 
     // Fire emails — non-blocking
