@@ -14,14 +14,25 @@ const razorpay = new Razorpay({
 })
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
-async function getAuthUser(req: Request) {
+async function getAuthUser(req: Request): Promise<{ id: string; email: string | undefined; role: string } | null> {
   const token =
     req.cookies?.lx_access_token ||
     req.headers.authorization?.replace('Bearer ', '')
   if (!token) return null
   const { data, error } = await supabase.auth.getUser(token)
   if (error || !data.user) return null
-  return data.user
+
+  const { data: account } = await supabase
+    .from('accounts')
+    .select('role')
+    .eq('id', data.user.id)
+    .single()
+
+  return {
+    id: data.user.id,
+    email: data.user.email,
+    role: account?.role ?? (data.user.role ?? 'client'),
+  }
 }
 
 // ── Agora token helpers ───────────────────────────────────────────────────────
@@ -71,7 +82,7 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
   try {
     const user = await getAuthUser(req)
     if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
-    if (user.user_metadata?.role !== 'client') {
+    if (user.role !== 'client') {
       res.status(403).json({ error: 'Only clients can initiate consultations' }); return
     }
 
@@ -214,7 +225,7 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
   try {
     const user = await getAuthUser(req)
     if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
-    if (user.user_metadata?.role !== 'lawyer') { res.status(403).json({ error: 'Only lawyers can accept' }); return }
+    if (user.role !== 'lawyer') { res.status(403).json({ error: 'Only lawyers can accept' }); return }
 
     const { data: consultation, error } = await supabase
       .from('consultations').select('*').eq('id', req.params.id).single()
@@ -286,7 +297,7 @@ router.get('/my', async (req: Request, res: Response) => {
     const page = Math.max(1, Number(req.query.page) || 1)
     const limit = 20
     const offset = (page - 1) * limit
-    const filterCol = user.user_metadata?.role === 'lawyer' ? 'lawyer_id' : 'client_id'
+    const filterCol = user.role === 'lawyer' ? 'lawyer_id' : 'client_id'
 
     const { data, error, count } = await supabase
       .from('consultations')

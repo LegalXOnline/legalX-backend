@@ -18,7 +18,9 @@ async function requireAdmin(req: Request, res: Response, next: NextFunction) {
       return res.status(401).json({ error: 'Invalid or expired session' })
     }
 
-    const role = data.user.user_metadata?.role
+    // Get role from accounts table — source of truth
+    const { data: account } = await supabase.from('accounts').select('role').eq('id', data.user.id).single()
+    const role = account?.role ?? data.user.user_metadata?.role
     if (role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden — admin access only' })
     }
