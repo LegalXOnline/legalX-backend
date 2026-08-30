@@ -71,8 +71,8 @@ router.post('/lawyer-doc', upload.single('file'), async (req: Request, res: Resp
       })
 
     if (uploadError) {
-      console.error('[upload/lawyer-doc] Storage error:', uploadError.message)
-      return res.status(500).json({ error: 'File upload failed. Please try again.' })
+      console.error('[upload/lawyer-doc] Storage error full:', JSON.stringify(uploadError))
+      return res.status(500).json({ error: `File upload failed: ${uploadError.message}` })
     }
 
     return res.json({ path: storagePath })
