@@ -16,14 +16,25 @@ const upload = multer({
 })
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
-async function getAuthUser(req: Request) {
+async function getAuthUser(req: Request): Promise<{ id: string; email: string | undefined; role: string } | null> {
   const token =
     req.cookies?.lx_access_token ||
     req.headers.authorization?.replace('Bearer ', '')
   if (!token) return null
   const { data, error } = await supabase.auth.getUser(token)
   if (error || !data.user) return null
-  return data.user
+
+  const { data: account } = await supabase
+    .from('accounts')
+    .select('role')
+    .eq('id', data.user.id)
+    .single()
+
+  return {
+    id: data.user.id,
+    email: data.user.email,
+    role: account?.role ?? (data.user.role ?? 'client'),
+  }
 }
 
 const VALID_DOC_TYPES = ['profile_photo', 'enrolment_cert', 'bar_id_front', 'bar_id_back', 'govt_id'] as const
@@ -36,7 +47,7 @@ router.post('/lawyer-doc', upload.single('file'), async (req: Request, res: Resp
   try {
     const user = await getAuthUser(req)
     if (!user) return res.status(401).json({ error: 'Not authenticated' })
-    if (user.user_metadata?.role !== 'lawyer') {
+    if (user.role !== 'lawyer') {
       return res.status(403).json({ error: 'Only lawyers can upload documents' })
     }
     if (!req.file) return res.status(400).json({ error: 'No file provided' })
