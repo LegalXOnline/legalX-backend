@@ -253,22 +253,25 @@ router.post('/onboarding', async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Failed to save onboarding data. Please try again.' })
     }
 
-    // ── Step 2: Upsert bank details into lawyer_bank_details (separate table) ──
-    if (bankAccountNumber?.trim() && bankIfsc?.trim()) {
-      const { error: bankError } = await supabase
-        .from('lawyer_bank_details')
-        .upsert({
-          account_id:     user.id,
-          beneficiary:    bankName?.trim() || `${firstName} ${lastName}`.trim(),
-          account_number: bankAccountNumber.trim(),
-          ifsc:           bankIfsc.trim().toUpperCase(),
-          bank_name:      bankName?.trim() || 'Unknown',
-          is_primary:     true,
-        }, { onConflict: 'account_id, account_number' })
+    // ── Step 2: Upsert bank details into lawyer_bank_details ──
+    // Real schema: lawyer_id, account_holder_name, ifsc_code, bank_name
+    if (bankIfsc?.trim() || bankName?.trim() || bankAccountNumber?.trim()) {
+      try {
+        const { error: bankError } = await supabase
+          .from('lawyer_bank_details')
+          .upsert({
+            lawyer_id:           user.id,
+            account_holder_name: bankName?.trim() || `${firstName ?? ''} ${lastName ?? ''}`.trim() || 'Unknown',
+            ifsc_code:           bankIfsc?.trim().toUpperCase() ?? null,
+            bank_name:           bankName?.trim() ?? null,
+            updated_at:          new Date().toISOString(),
+          }, { onConflict: 'lawyer_id' })
 
-      if (bankError) {
-        // Non-fatal: profile already saved; log but don't block
-        console.error('[lawyers/onboarding] Bank details upsert error:', bankError.message)
+        if (bankError) {
+          console.error('[lawyers/onboarding] Bank details upsert error (non-fatal):', bankError.message)
+        }
+      } catch (bankErr) {
+        console.error('[lawyers/onboarding] Bank step threw (non-fatal):', bankErr)
       }
     }
 

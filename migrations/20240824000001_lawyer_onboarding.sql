@@ -221,3 +221,11 @@ ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS phone               TEXT;
 ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS languages            TEXT[] DEFAULT '{English}';
 ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS specializations      TEXT[] DEFAULT '{}';
 ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS primary_specialization TEXT;
+
+-- ── Patch: lawyer_bank_details — add missing columns (2026-08-31) ──────────
+ALTER TABLE lawyer_bank_details ADD COLUMN IF NOT EXISTS account_number TEXT;
+ALTER TABLE lawyer_bank_details ADD COLUMN IF NOT EXISTS upi_id TEXT;
+ALTER TABLE lawyer_bank_details ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT true;
+-- Ensure unique constraint on lawyer_id for upsert to work
+ALTER TABLE lawyer_bank_details DROP CONSTRAINT IF EXISTS lawyer_bank_details_lawyer_id_key;
+ALTER TABLE lawyer_bank_details ADD CONSTRAINT lawyer_bank_details_lawyer_id_key UNIQUE (lawyer_id);
