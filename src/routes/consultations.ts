@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express'
 import Razorpay from 'razorpay'
 import { RtcTokenBuilder, RtcRole } from 'agora-token'
 import crypto from 'crypto'
-import { supabase } from '../lib/supabase'
+import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody } from '../lib/validation'
 import { z } from 'zod'
 
@@ -19,7 +19,7 @@ async function getAuthUser(req: Request): Promise<{ id: string; email: string | 
     req.cookies?.lx_access_token ||
     req.headers.authorization?.replace('Bearer ', '')
   if (!token) return null
-  const { data, error } = await supabase.auth.getUser(token)
+  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
   if (error || !data.user) return null
 
   const { data: account } = await supabase
