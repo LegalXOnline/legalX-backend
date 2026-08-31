@@ -114,7 +114,7 @@ const validateCsrf = (req: express.Request, res: express.Response, next: express
 // ── Security middleware ───────────────────────────────────────────────────────
 app.use(helmet())
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',')
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim())
 app.use(cors({
   origin: (origin, cb) => {
     // allow curl / server-side calls (no origin header)
