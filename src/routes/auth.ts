@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express'
+import { isProduction } from '../lib/env'
 import { supabase, supabaseAuth } from '../lib/supabase'
 import { sendWelcomeEmail, sendLawyerOnboardingWelcome } from '../lib/email'
 import { validateBody, authSignupSchema, authLoginSchema } from '../lib/validation'
@@ -80,7 +81,6 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
 
     const { access_token, refresh_token, expires_in } = data.session
     const user = data.user
-    const isProduction = process.env.NODE_ENV === 'production'
 
     // Set HttpOnly cookies — JS on the browser CANNOT read these
     res.cookie('lx_access_token', access_token, {
@@ -143,8 +143,6 @@ router.post('/logout', async (req: Request, res: Response) => {
   if (token) {
     await supabase.auth.admin.signOut(token).catch(() => {})
   }
-
-  const isProduction = process.env.NODE_ENV === 'production'
   res.clearCookie('lx_access_token', {
     httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', path: '/',
   })
