@@ -172,25 +172,30 @@ router.post('/onboarding', async (req: Request, res: Response) => {
       notableAchievements, certifications,
     } = req.body
 
-    // Build signed URLs for admin email (24-hour expiry)
-    const docPaths: Record<string, string> = {
-      enrolment_cert: enrolmentCertPath,
-      bar_id_front:   barIdFrontPath,
-      bar_id_back:    barIdBackPath,
-      govt_id:        govtIdPath,
-    }
-    if (profilePhotoPath) docPaths.profile_photo = profilePhotoPath
-
+    // Build signed URLs for admin email — non-fatal if storage fails
     const signedUrls: Record<string, string> = {}
-    for (const [key, path] of Object.entries(docPaths)) {
-      if (!path) continue
-      const { data } = await supabase.storage
-        .from('legalx-lawyer-docs')
-        .createSignedUrl(path, 86400) // 24 hours
-      if (data?.signedUrl) signedUrls[key] = data.signedUrl
+    try {
+      const docPaths: Record<string, string | undefined> = {
+        enrolment_cert: enrolmentCertPath,
+        bar_id_front:   barIdFrontPath,
+        bar_id_back:    barIdBackPath,
+        govt_id:        govtIdPath,
+        ...(profilePhotoPath ? { profile_photo: profilePhotoPath } : {}),
+      }
+      for (const [key, path] of Object.entries(docPaths)) {
+        if (!path) continue
+        const { data } = await supabase.storage
+          .from('legalx-lawyer-docs')
+          .createSignedUrl(path, 86400)
+        if (data?.signedUrl) signedUrls[key] = data.signedUrl
+      }
+    } catch (storageErr) {
+      // Non-fatal — onboarding still saves; admin gets doc paths in email
+      console.error('[lawyers/onboarding] signedUrl error (non-fatal):', storageErr)
     }
 
     // ── Step 1: Upsert lawyer_profiles (no bank cols — those go to lawyer_bank_details) ──
+    console.log('[lawyers/onboarding] Starting upsert for user:', user.id, '| env:', process.env.NODE_ENV, '| RENDER:', process.env.RENDER)
     const { error: upsertError } = await supabase
       .from('lawyer_profiles')
       .upsert({
@@ -218,19 +223,19 @@ router.post('/onboarding', async (req: Request, res: Response) => {
         firm_name:           firmName ?? null,
         linkedin_url:        linkedinUrl ?? null,
         website_url:         websiteUrl ?? null,
-        courts_practiced:    courtsPracticed ?? [],
+        courts_practiced:    Array.isArray(courtsPracticed) ? courtsPracticed : [],
         years_experience:    yearsExperience ? Number(yearsExperience) : 0,
         // languages/specializations/primary_specialization may be missing in older schema
         ...(languages      ? { languages }                                                            : {}),
         ...(specializations ? { specializations }                                                    : {}),
         ...(specializations ? { primary_specialization: primarySpecialization ?? specializations?.[0] ?? 'General Practice' } : {}),
         // Page 3 — Services
-        consultation_types:     consultationTypes ?? ['chat', 'voice', 'video'],
+        consultation_types:     Array.isArray(consultationTypes) ? consultationTypes : ['chat', 'voice', 'video'],
         consultation_fee_chat:  feeChat  ? Number(feeChat)  : 20,
         consultation_fee_voice: feeVoice ? Number(feeVoice) : 30,
         consultation_fee_video: feeVideo ? Number(feeVideo) : 40,
-        document_services:   documentServices ?? [],
-        availability_slots:  availabilitySlots ?? {},
+        document_services:   Array.isArray(documentServices) ? documentServices : [],
+        availability_slots:  (availabilitySlots && typeof availabilitySlots === 'object') ? availabilitySlots : {},
         // Page 4 — Payout (upi_id, pan, gst live on lawyer_profiles; bank rows go to lawyer_bank_details)
         upi_id:              upiId ?? null,
         pan_number:          panNumber ?? null,
@@ -244,7 +249,7 @@ router.post('/onboarding', async (req: Request, res: Response) => {
       }, { onConflict: 'account_id' })
 
     if (upsertError) {
-      console.error('[lawyers/onboarding] DB upsert error:', upsertError.message)
+      console.error('[lawyers/onboarding] DB upsert error FULL:', JSON.stringify(upsertError))
       return res.status(500).json({ error: 'Failed to save onboarding data. Please try again.' })
     }
 
@@ -283,7 +288,7 @@ router.post('/onboarding', async (req: Request, res: Response) => {
 
     return res.json({ ok: true, message: 'Onboarding complete. Documents submitted for review.' })
   } catch (err) {
-    console.error('[lawyers/onboarding] Unexpected error:', err)
+    console.error('[lawyers/onboarding] Unexpected error FULL:', err instanceof Error ? err.stack : JSON.stringify(err))
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
