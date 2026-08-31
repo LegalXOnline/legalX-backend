@@ -195,10 +195,11 @@ router.post('/onboarding', async (req: Request, res: Response) => {
       .from('lawyer_profiles')
       .upsert({
         account_id:          user.id,
-        email:               user.email,
-        first_name:          firstName,
-        last_name:           lastName,
-        phone,
+        // email & phone may not exist in older schema — spread conditionally
+        ...(user.email   ? { email: user.email } : {}),
+        ...(firstName    ? { first_name: firstName } : {}),
+        ...(lastName     ? { last_name: lastName }   : {}),
+        ...(phone        ? { phone }                 : {}),
         // Page 1 — Credentials
         bar_council_state:   barCouncilState,
         bar_council_number:  barCouncilNumber,
@@ -217,11 +218,12 @@ router.post('/onboarding', async (req: Request, res: Response) => {
         firm_name:           firmName ?? null,
         linkedin_url:        linkedinUrl ?? null,
         website_url:         websiteUrl ?? null,
-        languages:           languages ?? ['English'],
         courts_practiced:    courtsPracticed ?? [],
-        specializations:     specializations ?? [],
-        primary_specialization: primarySpecialization ?? (specializations?.[0] ?? 'General Practice'),
         years_experience:    yearsExperience ? Number(yearsExperience) : 0,
+        // languages/specializations/primary_specialization may be missing in older schema
+        ...(languages      ? { languages }                                                            : {}),
+        ...(specializations ? { specializations }                                                    : {}),
+        ...(specializations ? { primary_specialization: primarySpecialization ?? specializations?.[0] ?? 'General Practice' } : {}),
         // Page 3 — Services
         consultation_types:     consultationTypes ?? ['chat', 'voice', 'video'],
         consultation_fee_chat:  feeChat  ? Number(feeChat)  : 20,

@@ -213,3 +213,11 @@ CREATE INDEX IF NOT EXISTS idx_lawyer_profiles_onboarding
 --   DROP COLUMN IF EXISTS notable_achievements,
 --   DROP COLUMN IF EXISTS certifications;
 -- DROP TABLE IF EXISTS consultation_notifications;
+
+-- ── Patch: columns confirmed missing from schema cache (added 2026-08-31) ────
+-- Run these if the above were not applied or schema cache was stale:
+ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS email               TEXT;
+ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS phone               TEXT;
+ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS languages            TEXT[] DEFAULT '{English}';
+ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS specializations      TEXT[] DEFAULT '{}';
+ALTER TABLE lawyer_profiles ADD COLUMN IF NOT EXISTS primary_specialization TEXT;
