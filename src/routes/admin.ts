@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express'
-import { supabase } from '../lib/supabase'
+import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody, validateParams, lawyerIdParamSchema, adminLawyerRejectBodySchema } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 
@@ -13,7 +13,7 @@ async function requireAdmin(req: Request, res: Response, next: NextFunction) {
       return res.status(401).json({ error: 'Not authenticated' })
     }
 
-    const { data, error } = await supabase.auth.getUser(token)
+    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
     if (error || !data.user) {
       return res.status(401).json({ error: 'Invalid or expired session' })
     }

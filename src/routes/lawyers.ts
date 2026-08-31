@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express'
-import { supabase } from '../lib/supabase'
+import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import {
   sendLawyerDocsSubmittedAdmin,
   sendLawyerDocsReceivedConfirmation,
@@ -15,7 +15,7 @@ async function getAuthUser(req: Request): Promise<{ id: string; email: string | 
     req.headers.authorization?.replace('Bearer ', '')
   if (!token) return null
 
-  const { data, error } = await supabase.auth.getUser(token)
+  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
   if (error || !data.user) return null
 
   // Get role from accounts table — not user_metadata

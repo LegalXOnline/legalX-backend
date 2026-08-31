@@ -8,16 +8,26 @@ if (!url || !serviceKey) {
 }
 
 /**
- * Admin client — service_role key.
- * Bypasses Row Level Security. Used for all server-side operations.
- * Never expose this key to the browser.
+ * PRIMARY admin client — service_role key.
+ * Used for all DB reads/writes and storage operations.
+ * NEVER call supabase.auth.setSession() or supabase.auth.getUser(userJwt)
+ * on this client — it will contaminate the session context for subsequent ops.
  */
 export const supabase = createClient(url, serviceKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
 
 /**
- * Alias for auth routes that previously used the anon client.
- * The service_role key fully supports signInWithPassword on the server.
+ * AUTH validation client — service_role key, separate instance.
+ * Use ONLY for validating incoming user JWTs via auth.getUser(token).
+ * Keeping this separate from `supabase` ensures user-JWT context
+ * never leaks into DB or storage operations on the primary client.
+ */
+export const supabaseAuthValidator = createClient(url, serviceKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+})
+
+/**
+ * Alias kept for backward compat — same as supabase (service role).
  */
 export const supabaseAuth = supabase

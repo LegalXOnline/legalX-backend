@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express'
-import { supabase } from '../lib/supabase'
+import { supabase, supabaseAuthValidator } from '../lib/supabase'
 
 const router = Router()
 
@@ -18,7 +18,7 @@ router.get('/stream', async (req: Request, res: Response) => {
     return
   }
 
-  const { data: authData, error: authError } = await supabase.auth.getUser(token)
+  const { data: authData, error: authError } = await supabaseAuthValidator.auth.getUser(token)
   if (authError || !authData.user) {
     res.status(401).json({ error: 'Session expired' })
     return

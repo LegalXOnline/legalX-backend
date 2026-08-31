@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
-import { supabase } from '../lib/supabase'
+import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { sendPaymentSuccess } from '../lib/email'
 
 const router = Router()
@@ -19,7 +19,7 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
       return res.status(401).json({ error: 'Not authenticated' })
     }
 
-    const { data, error } = await supabase.auth.getUser(token)
+    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
     if (error || !data.user) {
       return res.status(401).json({ error: 'Invalid or expired session' })
     }
