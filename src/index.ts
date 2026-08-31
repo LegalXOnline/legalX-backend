@@ -1,3 +1,4 @@
+import { isProduction, isDevelopment } from './lib/env'
 import 'dotenv/config'
 import crypto from 'crypto'
 import express from 'express'
@@ -55,7 +56,7 @@ app.use((req, res, next) => {
 })
 
 // Parse cookies before CSRF middleware reads req.signedCookies
-if (!process.env.COOKIE_SECRET && process.env.NODE_ENV === 'production') {
+if (!process.env.COOKIE_SECRET && isProduction) {
   throw new Error('COOKIE_SECRET env var is required in production')
 }
 app.use(cookieParser(process.env.COOKIE_SECRET || 'lx_dev_cookie_secret_only'))
@@ -65,7 +66,7 @@ const csrfProtection = new csrf()
 const CSRF_COOKIE_NAME = 'csrf_token'
 const CSRF_SECRET_COOKIE = 'csrf_secret' // Phase 1.4: session-scoped secret
 const CSRF_HEADER_NAME = 'x-csrf-token'
-const isProd = process.env.NODE_ENV === 'production'
+const isProd = isProduction
 
 // Phase 1.4: Store CSRF secret in signed HttpOnly cookie (per-session, not per-request)
 // This prevents CSRF token mismatch when navigating between pages
@@ -119,7 +120,7 @@ app.use(cors({
     // allow curl / server-side calls (no origin header)
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true)
     // Allow vercel, netlify, and legalxonline domains in production
-    if (process.env.NODE_ENV === 'production' && (
+    if (isProduction && (
       origin.endsWith('.vercel.app') || 
       origin.endsWith('.netlify.app') ||
       origin === 'https://legalxonline.com' ||
@@ -137,7 +138,7 @@ app.use(cors({
 // Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 // In development there is no proxy, so we leave trust proxy off but tell
 // the rate-limiter to skip the X-Forwarded-For header validation.
-if (process.env.NODE_ENV === 'production') {
+if (isProduction) {
   app.set('trust proxy', 1) // trust Render's single-hop load balancer
 }
 
@@ -149,7 +150,7 @@ app.use(rateLimit({
   legacyHeaders: false,
   // In development (no proxy), suppress the X-Forwarded-For validation error.
   // In production trust proxy is set above so this is already safe.
-  validate: { xForwardedForHeader: process.env.NODE_ENV === 'production' },
+  validate: { xForwardedForHeader: isProduction },
 }))
 
 
