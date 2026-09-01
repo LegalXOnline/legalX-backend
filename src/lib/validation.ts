@@ -146,6 +146,38 @@ export const accountIdParamSchema = z.object({
   id: z.string().uuid(),
 })
 
+export const adminDisputeUpdateSchema = z.object({
+  status: z.enum(['open', 'investigating', 'resolved', 'escalated']),
+  resolutionNote: z.string().max(2000).trim().optional(),
+})
+
+export const adminPayoutGenerateSchema = z.object({
+  periodStart: z.string().date(),
+  periodEnd: z.string().date(),
+})
+
+export const adminPayoutHoldSchema = z.object({
+  reason: z.string().min(3, 'A reason is required').max(500).trim(),
+})
+
+export const adminPayoutStatusSchema = z.object({
+  status: z.enum(['pending', 'processing', 'paid', 'cancelled']),
+  bankRef: z.string().max(120).trim().optional(),
+})
+
+export const adminArticleSchema = z.object({
+  title: z.string().min(3).max(200).trim(),
+  slug: z.string().min(3).max(200).trim().regex(/^[a-z0-9-]+$/, 'Slug must be lowercase letters, numbers and hyphens'),
+  content: z.string().max(100_000),
+  status: z.enum(['draft', 'published']).default('draft'),
+})
+
+export const adminArticleUpdateSchema = adminArticleSchema.partial()
+
+export const uuidParamSchema = z.object({
+  id: z.string().uuid(),
+})
+
 export function validateBody<T extends z.ZodType>(schema: T) {
   return (req: Request, res: Response, next: NextFunction) => {
     const result = schema.safeParse(req.body)

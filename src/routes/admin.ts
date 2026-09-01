@@ -15,6 +15,13 @@ import {
   adminFlagBodySchema,
   adminBulkLawyerSchema,
   adminWalletAdjustSchema,
+  adminDisputeUpdateSchema,
+  adminPayoutGenerateSchema,
+  adminPayoutHoldSchema,
+  adminPayoutStatusSchema,
+  adminArticleSchema,
+  adminArticleUpdateSchema,
+  uuidParamSchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 
@@ -698,6 +705,537 @@ router.get('/lawyers/:id/docs', requireAdmin, validateParams(lawyerIdParamSchema
       lawyer: { name: `${lawyer.first_name} ${lawyer.last_name}`, email: lawyer.email, govtIdType: lawyer.govt_id_type },
       docs: signedDocs,
     })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── GET /api/admin/disputes ──────────────────────────────────────────────────
+router.get('/disputes', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('disputes')
+      .select('id, consultation_id, service_order_id, client_id, lawyer_id, reason, status, resolution_note, created_at, updated_at', { count: 'exact' })
+
+    if (status && status !== 'all') query = query.eq('status', status)
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+
+    const disputes = data ?? []
+
+    // Resolve client and lawyer names in two batched lookups.
+    const accountIds = [...new Set(disputes.flatMap(d => [d.client_id, d.lawyer_id]).filter(Boolean))] as string[]
+    const names = new Map<string, string>()
+    if (accountIds.length) {
+      const { data: people } = await supabase
+        .from('accounts').select('id, first_name, last_name, email').in('id', accountIds)
+      for (const p of people ?? []) {
+        names.set(p.id, [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email)
+      }
+    }
+
+    res.json({
+      disputes: disputes.map(d => ({
+        ...d,
+        client_name: d.client_id ? names.get(d.client_id) ?? 'Unknown' : null,
+        lawyer_name: d.lawyer_id ? names.get(d.lawyer_id) ?? 'Unknown' : null,
+      })),
+      total: count ?? 0,
+      page,
+      pageSize,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── PATCH /api/admin/disputes/:id ────────────────────────────────────────────
+router.patch('/disputes/:id', requireAdmin, validateParams(uuidParamSchema), validateBody(adminDisputeUpdateSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { status, resolutionNote } = req.body
+
+    const { data: prev } = await supabase
+      .from('disputes').select('status, resolution_note').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Dispute not found' })
+
+    const update: Record<string, unknown> = {
+      status,
+      resolution_note: resolutionNote ?? prev.resolution_note,
+      updated_at: new Date().toISOString(),
+    }
+    // Stamp who closed it, only on the transition into resolved.
+    if (status === 'resolved') update.resolved_by = (req as any).user.id
+
+    const { error } = await supabase.from('disputes').update(update).eq('id', id)
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: 'UPDATE_DISPUTE', entityType: 'dispute', entityId: id,
+      before: { status: prev.status },
+      after: { status, resolution_note: resolutionNote ?? null },
+    })
+
+    return res.json({ message: 'Dispute updated' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── Payout maths ──────────────────────────────────────────────────────────────
+// Section 194J TDS on professional fees: 10% when the payee's PAN is on file,
+// 20% when it is not. Platform commission is taken off the gross first.
+const PLATFORM_FEE_RATE = 0.20
+const TDS_RATE_WITH_PAN = 0.10
+const TDS_RATE_NO_PAN   = 0.20
+
+// ── GET /api/admin/payouts ───────────────────────────────────────────────────
+router.get('/payouts', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('payouts')
+      .select('id, lawyer_id, period_start, period_end, gross_amount, tds_amount, platform_fee, net_amount, status, hold_reason, transaction_count, bank_ref, paid_at, created_at', { count: 'exact' })
+
+    if (status && status !== 'all') query = query.eq('status', status)
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+
+    const payouts = data ?? []
+    const lawyerIds = [...new Set(payouts.map(p => p.lawyer_id))]
+
+    const meta = new Map<string, { name: string; hasPan: boolean }>()
+    if (lawyerIds.length) {
+      const { data: lawyers } = await supabase
+        .from('lawyer_profiles')
+        .select('account_id, first_name, last_name, email, pan_number')
+        .in('account_id', lawyerIds)
+      for (const l of lawyers ?? []) {
+        meta.set(l.account_id, {
+          name: [l.first_name, l.last_name].filter(Boolean).join(' ') || l.email || 'Unknown',
+          hasPan: !!l.pan_number,
+        })
+      }
+    }
+
+    // Cumulative gross per lawyer this financial year — drives the ₹30,000
+    // Section 194J threshold warning shown in the UI.
+    const fyStart = (() => {
+      const now = new Date()
+      const year = now.getUTCMonth() >= 3 ? now.getUTCFullYear() : now.getUTCFullYear() - 1
+      return `${year}-04-01`
+    })()
+    const cumulative = new Map<string, number>()
+    if (lawyerIds.length) {
+      const { data: ytd } = await supabase
+        .from('payouts').select('lawyer_id, gross_amount')
+        .in('lawyer_id', lawyerIds).gte('period_start', fyStart)
+      for (const row of ytd ?? []) {
+        cumulative.set(row.lawyer_id, (cumulative.get(row.lawyer_id) ?? 0) + Number(row.gross_amount ?? 0))
+      }
+    }
+
+    res.json({
+      payouts: payouts.map(p => ({
+        ...p,
+        lawyer_name: meta.get(p.lawyer_id)?.name ?? 'Unknown',
+        has_pan: meta.get(p.lawyer_id)?.hasPan ?? false,
+        fy_cumulative_gross: cumulative.get(p.lawyer_id) ?? 0,
+      })),
+      total: count ?? 0,
+      page,
+      pageSize,
+      fyStart,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── POST /api/admin/payouts/generate ─────────────────────────────────────────
+// Builds one payout row per lawyer with paid consultations in the window.
+// Re-runnable: the unique index on (lawyer_id, period_start, period_end) means
+// a second run updates the existing row instead of duplicating it.
+router.post('/payouts/generate', requireAdmin, validateBody(adminPayoutGenerateSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { periodStart, periodEnd } = req.body
+    if (periodEnd < periodStart) {
+      return res.status(400).json({ error: 'Period end must be on or after period start.' })
+    }
+
+    // periodEnd is a date; extend to end-of-day so that day's work is included.
+    const { data: consults, error } = await supabase
+      .from('consultations')
+      .select('lawyer_id, total_amount')
+      .eq('payment_status', 'paid')
+      .gte('created_at', `${periodStart}T00:00:00Z`)
+      .lte('created_at', `${periodEnd}T23:59:59Z`)
+    if (error) throw error
+
+    const totals = new Map<string, { gross: number; count: number }>()
+    for (const c of consults ?? []) {
+      if (!c.lawyer_id) continue
+      const entry = totals.get(c.lawyer_id) ?? { gross: 0, count: 0 }
+      entry.gross += Number(c.total_amount ?? 0)
+      entry.count += 1
+      totals.set(c.lawyer_id, entry)
+    }
+
+    if (totals.size === 0) {
+      return res.json({ created: 0, payouts: [], message: 'No paid consultations in that period.' })
+    }
+
+    const lawyerIds = [...totals.keys()]
+    const { data: lawyers } = await supabase
+      .from('lawyer_profiles').select('account_id, pan_number').in('account_id', lawyerIds)
+    const panMap = new Map((lawyers ?? []).map(l => [l.account_id, !!l.pan_number]))
+
+    const rows = lawyerIds.map(lawyerId => {
+      const { gross, count } = totals.get(lawyerId)!
+      const platformFee = +(gross * PLATFORM_FEE_RATE).toFixed(2)
+      const taxable = gross - platformFee
+      const tds = +(taxable * (panMap.get(lawyerId) ? TDS_RATE_WITH_PAN : TDS_RATE_NO_PAN)).toFixed(2)
+      return {
+        lawyer_id: lawyerId,
+        period_start: periodStart,
+        period_end: periodEnd,
+        gross_amount: +gross.toFixed(2),
+        platform_fee: platformFee,
+        tds_amount: tds,
+        net_amount: +(taxable - tds).toFixed(2),
+        transaction_count: count,
+        status: 'pending',
+        updated_at: new Date().toISOString(),
+      }
+    })
+
+    const { data: inserted, error: upsertErr } = await supabase
+      .from('payouts')
+      .upsert(rows, { onConflict: 'lawyer_id,period_start,period_end' })
+      .select('id, lawyer_id, net_amount')
+    if (upsertErr) throw upsertErr
+
+    await writeAudit(req, {
+      action: 'GENERATE_PAYOUTS', entityType: 'payout', entityId: null,
+      after: { periodStart, periodEnd, count: rows.length },
+    })
+
+    return res.json({ created: inserted?.length ?? 0, payouts: inserted ?? [] })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── PATCH /api/admin/payouts/:id/hold ────────────────────────────────────────
+router.patch('/payouts/:id/hold', requireAdmin, validateParams(uuidParamSchema), validateBody(adminPayoutHoldSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { reason } = req.body
+
+    const { data: prev } = await supabase.from('payouts').select('status').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Payout not found' })
+    if (prev.status === 'paid') {
+      return res.status(400).json({ error: 'This payout has already been paid and cannot be held.' })
+    }
+
+    const { error } = await supabase
+      .from('payouts')
+      .update({ status: 'held', hold_reason: reason, updated_at: new Date().toISOString() })
+      .eq('id', id)
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: 'HOLD_PAYOUT', entityType: 'payout', entityId: id,
+      before: { status: prev.status }, after: { status: 'held', reason },
+    })
+
+    return res.json({ message: 'Payout held' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── PATCH /api/admin/payouts/:id/status ──────────────────────────────────────
+router.patch('/payouts/:id/status', requireAdmin, validateParams(uuidParamSchema), validateBody(adminPayoutStatusSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { status, bankRef } = req.body
+
+    const { data: prev } = await supabase.from('payouts').select('status').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Payout not found' })
+
+    const update: Record<string, unknown> = {
+      status,
+      hold_reason: null,
+      bank_ref: bankRef ?? null,
+      updated_at: new Date().toISOString(),
+    }
+    if (status === 'paid') update.paid_at = new Date().toISOString()
+
+    const { error } = await supabase.from('payouts').update(update).eq('id', id)
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: 'UPDATE_PAYOUT_STATUS', entityType: 'payout', entityId: id,
+      before: { status: prev.status }, after: { status, bankRef: bankRef ?? null },
+    })
+
+    return res.json({ message: 'Payout updated' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── GET /api/admin/documents ─────────────────────────────────────────────────
+// Service orders still in flight, with the data the UI needs for SLA colouring.
+router.get('/documents', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('service_orders')
+      .select('id, order_number, account_id, service_id, assigned_lawyer_id, status, price, customer_notes, internal_notes, created_at, updated_at, completed_at', { count: 'exact' })
+
+    if (status && status !== 'all') {
+      query = query.eq('status', status)
+    } else {
+      // Default view is work in progress — completed and cancelled orders are
+      // noise on an operations screen.
+      query = query.in('status', ['pending_payment', 'in_progress', 'pending_customer_input', 'in_review', 'revision_requested'])
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: true })
+      .range(from, to)
+    if (error) throw error
+
+    const orders = data ?? []
+    const accountIds = [...new Set(orders.map(o => o.account_id).filter(Boolean))] as string[]
+    const lawyerIds = [...new Set(orders.map(o => o.assigned_lawyer_id).filter(Boolean))] as string[]
+    const serviceIds = [...new Set(orders.map(o => o.service_id).filter(Boolean))] as string[]
+
+    const [peopleRes, servicesRes] = await Promise.all([
+      accountIds.length || lawyerIds.length
+        ? supabase.from('accounts').select('id, first_name, last_name, email').in('id', [...accountIds, ...lawyerIds])
+        : Promise.resolve({ data: [] as any[] }),
+      serviceIds.length
+        ? supabase.from('service_catalog').select('id, title, slug').in('id', serviceIds)
+        : Promise.resolve({ data: [] as any[] }),
+    ])
+
+    const names = new Map<string, string>()
+    for (const p of peopleRes.data ?? []) {
+      names.set(p.id, [p.first_name, p.last_name].filter(Boolean).join(' ') || p.email)
+    }
+    const services = new Map((servicesRes.data ?? []).map((s: any) => [s.id, s.title ?? s.slug]))
+
+    res.json({
+      orders: orders.map(o => ({
+        ...o,
+        client_name: o.account_id ? names.get(o.account_id) ?? 'Unknown' : 'Guest',
+        lawyer_name: o.assigned_lawyer_id ? names.get(o.assigned_lawyer_id) ?? 'Unknown' : null,
+        service_title: o.service_id ? services.get(o.service_id) ?? 'Service' : 'Service',
+      })),
+      total: count ?? 0,
+      page,
+      pageSize,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── GET /api/admin/analytics ─────────────────────────────────────────────────
+router.get('/analytics', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Default window is the last 6 months, inclusive of the current one.
+    const now = new Date()
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 5, 1)).toISOString()
+
+    const [consultRes, ordersRes, signupsRes, lawyersRes, disputesRes] = await Promise.all([
+      supabase.from('consultations').select('type, status, total_amount, payment_status, created_at').gte('created_at', start),
+      supabase.from('service_orders').select('status, price, created_at').gte('created_at', start),
+      supabase.from('accounts').select('role, created_at').gte('created_at', start),
+      supabase.from('lawyer_profiles').select('account_id, first_name, last_name, email, avg_rating, total_reviews, verification_status'),
+      supabase.from('disputes').select('id, status, created_at').gte('created_at', start),
+    ])
+
+    const monthKey = (iso: string) => iso.slice(0, 7) // YYYY-MM
+
+    // Seed every month in range so gaps render as zero instead of disappearing.
+    const months: string[] = []
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1))
+      months.push(d.toISOString().slice(0, 7))
+    }
+    const blank = () => Object.fromEntries(months.map(m => [m, 0])) as Record<string, number>
+
+    const revenueByMonth = blank()
+    const consultRevenue = blank()
+    const docRevenue = blank()
+    const clientSignups = blank()
+    const lawyerSignups = blank()
+
+    for (const c of consultRes.data ?? []) {
+      if (c.payment_status !== 'paid') continue
+      const m = monthKey(c.created_at)
+      if (!(m in revenueByMonth)) continue
+      const amt = Number(c.total_amount ?? 0)
+      revenueByMonth[m] += amt
+      consultRevenue[m] += amt
+    }
+    for (const o of ordersRes.data ?? []) {
+      if (o.status !== 'completed') continue
+      const m = monthKey(o.created_at)
+      if (!(m in revenueByMonth)) continue
+      const amt = Number(o.price ?? 0)
+      revenueByMonth[m] += amt
+      docRevenue[m] += amt
+    }
+    for (const a of signupsRes.data ?? []) {
+      const m = monthKey(a.created_at)
+      if (!(m in clientSignups)) continue
+      if (a.role === 'client') clientSignups[m] += 1
+      else if (a.role === 'lawyer') lawyerSignups[m] += 1
+    }
+
+    const consultByType: Record<string, number> = { chat: 0, voice: 0, video: 0 }
+    for (const c of consultRes.data ?? []) {
+      if (c.type && c.type in consultByType) consultByType[c.type] += 1
+    }
+
+    const leaderboard = (lawyersRes.data ?? [])
+      .filter(l => (l.total_reviews ?? 0) > 0)
+      .sort((a, b) => Number(b.avg_rating ?? 0) - Number(a.avg_rating ?? 0))
+      .slice(0, 10)
+      .map(l => ({
+        lawyer_id: l.account_id,
+        name: [l.first_name, l.last_name].filter(Boolean).join(' ') || l.email || 'Unknown',
+        avg_rating: Number(l.avg_rating ?? 0),
+        total_reviews: l.total_reviews ?? 0,
+      }))
+
+    const totalConsults = (consultRes.data ?? []).length
+    const totalDisputes = (disputesRes.data ?? []).length
+
+    res.json({
+      months,
+      revenueByMonth,
+      consultRevenue,
+      docRevenue,
+      clientSignups,
+      lawyerSignups,
+      consultByType,
+      leaderboard,
+      totals: {
+        consultations: totalConsults,
+        disputes: totalDisputes,
+        disputeRate: totalConsults ? +((totalDisputes / totalConsults) * 100).toFixed(1) : 0,
+        totalRevenue: Object.values(revenueByMonth).reduce((a, b) => a + b, 0),
+      },
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── Articles (content) ───────────────────────────────────────────────────────
+router.get('/articles', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status, search, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('articles')
+      .select('id, title, slug, content, status, published_at, created_at, updated_at', { count: 'exact' })
+
+    if (status && status !== 'all') query = query.eq('status', status)
+    if (search) {
+      const term = escapeLike(search)
+      if (term) query = query.or(`title.ilike.%${term}%,slug.ilike.%${term}%`)
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+
+    res.json({ articles: data ?? [], total: count ?? 0, page, pageSize })
+  } catch (err) {
+    next(err)
+  }
+})
+
+router.post('/articles', requireAdmin, validateBody(adminArticleSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { title, slug, content, status } = req.body
+    const { data, error } = await supabase
+      .from('articles')
+      .insert({
+        title, slug, content, status,
+        published_at: status === 'published' ? new Date().toISOString() : null,
+      })
+      .select('id, title, slug, status')
+      .single()
+
+    if (error) {
+      // 23505 = unique_violation, almost always the slug.
+      if ((error as any).code === '23505') {
+        return res.status(409).json({ error: 'An article with that slug already exists.' })
+      }
+      throw error
+    }
+
+    await writeAudit(req, {
+      action: 'CREATE_ARTICLE', entityType: 'article', entityId: data.id,
+      after: { title, slug, status },
+    })
+
+    return res.status(201).json({ article: data })
+  } catch (err) {
+    next(err)
+  }
+})
+
+router.patch('/articles/:id', requireAdmin, validateParams(uuidParamSchema), validateBody(adminArticleUpdateSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { data: prev } = await supabase
+      .from('articles').select('title, slug, status').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Article not found' })
+
+    const update: Record<string, unknown> = { ...req.body, updated_at: new Date().toISOString() }
+    // Stamp publish time on the draft -> published transition only.
+    if (req.body.status === 'published' && prev.status !== 'published') {
+      update.published_at = new Date().toISOString()
+    }
+
+    const { error } = await supabase.from('articles').update(update).eq('id', id)
+    if (error) {
+      if ((error as any).code === '23505') {
+        return res.status(409).json({ error: 'An article with that slug already exists.' })
+      }
+      throw error
+    }
+
+    await writeAudit(req, {
+      action: 'UPDATE_ARTICLE', entityType: 'article', entityId: id,
+      before: prev, after: req.body,
+    })
+
+    return res.json({ message: 'Article updated' })
   } catch (err) {
     next(err)
   }
