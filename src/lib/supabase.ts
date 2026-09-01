@@ -31,22 +31,3 @@ export const supabaseAuthValidator = createClient(url, serviceKey, {
  * Alias kept for backward compat — same as supabase (service role).
  */
 export const supabaseAuth = supabase
-
-/**
- * ANON client — used only for flows that must run as an unauthenticated
- * end user, i.e. sending password-recovery emails.
- *
- * flowType MUST stay 'implicit'. supabase-js defaults to PKCE, which stores a
- * code verifier in the client that started the flow — this server process. The
- * browser that finally opens the emailed link could never reach that verifier,
- * so the recovery would always fail. Implicit flow instead returns the tokens
- * to the browser in the URL hash, which /reset-password reads.
- */
-const anonKey = process.env.SUPABASE_ANON_KEY
-if (!anonKey) {
-  console.warn('[supabase] SUPABASE_ANON_KEY is not set — password recovery will fall back to the service-role key')
-}
-
-export const supabaseAnon = createClient(url, anonKey || serviceKey, {
-  auth: { persistSession: false, autoRefreshToken: false, flowType: 'implicit' },
-})
