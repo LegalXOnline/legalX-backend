@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { isProduction, resolveAppOrigin } from '../lib/env'
-import { supabase, supabaseAuth, supabaseAnon } from '../lib/supabase'
+import { supabase, supabaseAnon, supabaseSignIn, supabaseAuthValidator } from '../lib/supabase'
 import { sendWelcomeEmail, sendLawyerOnboardingWelcome, sendPasswordResetEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import {
@@ -122,12 +122,18 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
   try {
     const { email, password } = req.body
 
-    // Use anon client — correctly validates user credentials
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({
+    // Dedicated sign-in client — never the service-role one. See the note on
+    // supabaseSignIn: signing in on a client rebinds every later query from
+    // that client to the user's JWT.
+    const { data, error } = await supabaseSignIn.auth.signInWithPassword({
       email,
       password,
     })
 
+    // No signOut here: supabase-js routes even a 'local' signOut through
+    // GoTrue's logout endpoint, which would revoke the very tokens we are about
+    // to set as cookies. Leaving the session cached on this client is harmless
+    // because supabaseSignIn is never used for DB queries.
     if (error || !data.session) {
       // Phase 1.3: Constant-time response to prevent email enumeration via timing
       await new Promise(r => setTimeout(r, 200 + Math.random() * 100))
@@ -222,8 +228,9 @@ router.get('/me', async (req: Request, res: Response) => {
       return
     }
 
-    // service_role client validates the JWT — no DB hit for auth check
-    const { data, error } = await supabase.auth.getUser(token)
+    // Validate on the isolated validator client, never the primary one — the
+    // primary client's job is DB and storage access as service_role.
+    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
     if (error || !data.user) {
       res.status(401).json({ error: 'Session expired or invalid' })
       return
