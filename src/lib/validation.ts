@@ -40,26 +40,39 @@ export const paymentVerifySchema = z.object({
   razorpaySignature: z.string().min(1),
 })
 
-export const authSignupSchema = z.object({
-  email: z.string().email().max(255).trim().toLowerCase(),
-  password: z.string().min(8).max(128),
-  firstName: z.string().min(1).max(50).trim(),
-  lastName: z.string().min(1).max(50).trim(),
-  role: z.enum(['client', 'lawyer']).default('client'),
-})
-
-export const authLoginSchema = z.object({
-  email: z.string().email().max(255).trim().toLowerCase(),
-  password: z.string().min(1).max(128),
-})
-
-/** Mirrors the client-side rule shown on /reset-password: 8+ chars, 1 uppercase, 1 number. */
+/**
+ * The single password policy: 8+ chars, one uppercase, one number.
+ *
+ * Used by BOTH signup and reset. They diverged before — signup accepted any
+ * 8 characters while reset demanded uppercase and a digit, so new accounts
+ * could hold passwords the platform would refuse to let them set again.
+ * Keep these pointed at the same schema.
+ *
+ * Note this only applies going forward: accounts created under the old rule
+ * keep their existing password until they next reset it.
+ */
 const strongPasswordSchema = z
   .string()
   .min(8, 'Password must be at least 8 characters')
   .max(128)
   .regex(/[A-Z]/, 'Password must contain an uppercase letter')
   .regex(/[0-9]/, 'Password must contain a number')
+
+export const authSignupSchema = z.object({
+  email: z.string().email().max(255).trim().toLowerCase(),
+  password: strongPasswordSchema,
+  firstName: z.string().min(1).max(50).trim(),
+  lastName: z.string().min(1).max(50).trim(),
+  role: z.enum(['client', 'lawyer']).default('client'),
+})
+
+// Login deliberately does NOT use the strong schema — existing users may hold
+// weaker passwords, and rejecting them here would lock them out of the very
+// flow that lets them upgrade.
+export const authLoginSchema = z.object({
+  email: z.string().email().max(255).trim().toLowerCase(),
+  password: z.string().min(1).max(128),
+})
 
 export const authForgotPasswordSchema = z.object({
   email: z.string().email().max(255).trim().toLowerCase(),
