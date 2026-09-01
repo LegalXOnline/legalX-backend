@@ -94,6 +94,7 @@ router.get('/me', async (req: Request, res: Response) => {
       return res.json({
         onboarding_complete: false,
         verification_status: 'pending_signup',
+        is_online: false,
         profile: null,
       })
     }
@@ -102,6 +103,10 @@ router.get('/me', async (req: Request, res: Response) => {
       onboarding_complete:  data.onboarding_complete ?? false,
       verification_status:  data.verification_status ?? 'pending_signup',
       rejection_reason:     data.rejection_reason ?? null,
+      // Exposed at the top level on purpose: mapRow() renames this to `online`
+      // for the public directory, so the portal could never read it back and
+      // the availability switch reset to Offline on every page load.
+      is_online:            data.is_online ?? false,
       profile: mapRow(data),
     })
   } catch (err) {
@@ -120,10 +125,15 @@ router.patch('/me/status', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Only lawyers can update availability status' })
     }
 
-    const { isOnline } = req.body
-    if (typeof isOnline !== 'boolean') {
+    // Accept either spelling. The portal used to send `is_online` while this
+    // route only read `isOnline`, so every toggle 400'd and the UI rolled the
+    // switch straight back to offline. Tolerating both means an older cached
+    // bundle keeps working after deploy.
+    const raw = req.body?.isOnline ?? req.body?.is_online
+    if (typeof raw !== 'boolean') {
       return res.status(400).json({ error: 'isOnline must be a boolean' })
     }
+    const isOnline = raw
 
     // Upsert so the row always exists even if onboarding is incomplete
     const { error: updateError } = await supabase
