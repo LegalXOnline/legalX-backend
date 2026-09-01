@@ -1,12 +1,30 @@
 import { Router, Request, Response, NextFunction } from 'express'
-import { isProduction } from '../lib/env'
-import { supabase, supabaseAuth } from '../lib/supabase'
+import { isProduction, resolveAppOrigin } from '../lib/env'
+import { supabase, supabaseAuth, supabaseAnon, supabaseAuthValidator } from '../lib/supabase'
 import { sendWelcomeEmail, sendLawyerOnboardingWelcome } from '../lib/email'
-import { validateBody, authSignupSchema, authLoginSchema } from '../lib/validation'
+import { logger } from '../lib/logger'
+import {
+  validateBody,
+  authSignupSchema,
+  authLoginSchema,
+  authForgotPasswordSchema,
+  authResetPasswordSchema,
+} from '../lib/validation'
 
 import { rateLimit } from 'express-rate-limit'
 
 const router = Router()
+
+// Password-recovery endpoints send email and mutate credentials — much tighter
+// than the global 100/15min so a stolen inbox can't be brute-forced or spammed.
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: isProduction },
+  message: { error: 'Too many password reset attempts. Please wait 15 minutes and try again.' },
+})
 
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
 router.post('/signup', validateBody(authSignupSchema), async (req: Request, res: Response, next: NextFunction) => {
@@ -205,6 +223,67 @@ router.get('/me', async (req: Request, res: Response) => {
     res.status(401).json({ error: 'Invalid session' })
   }
 })
+
+// ── POST /api/auth/forgot-password ────────────────────────────────────────────
+// Sends a Supabase recovery email. Always answers 200 with the same body:
+// telling the caller whether an address is registered is an enumeration oracle.
+router.post(
+  '/forgot-password',
+  passwordResetLimiter,
+  validateBody(authForgotPasswordSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { email, origin } = req.body
+      const redirectTo = `${resolveAppOrigin(origin, req.get('origin'))}/reset-password`
+
+      const { error } = await supabaseAnon.auth.resetPasswordForEmail(email, { redirectTo })
+      if (error) {
+        // Logged, never returned — the caller must not learn why this failed.
+        logger.warn({ reqId: req.id, err: error.message }, 'resetPasswordForEmail failed')
+      }
+
+      res.json({ message: 'If an account exists for that email, a reset link is on its way.' })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+// ── POST /api/auth/reset-password ─────────────────────────────────────────────
+// Completes recovery. The browser posts the access_token it received in the
+// URL hash; we validate it, then set the new password with the admin client.
+router.post(
+  '/reset-password',
+  passwordResetLimiter,
+  validateBody(authResetPasswordSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { accessToken, password } = req.body
+
+      // Validate on the isolated validator client so the recovery JWT never
+      // becomes session context on the primary (DB/storage) client.
+      const { data, error } = await supabaseAuthValidator.auth.getUser(accessToken)
+      if (error || !data.user) {
+        res.status(401).json({ error: 'This reset link has expired. Please request a new one.' })
+        return
+      }
+
+      const { error: updateError } = await supabase.auth.admin.updateUserById(data.user.id, { password })
+      if (updateError) {
+        logger.error({ reqId: req.id, err: updateError.message }, 'updateUserById password reset failed')
+        res.status(400).json({ error: 'Could not update your password. Please request a new reset link.' })
+        return
+      }
+
+      // Burn the recovery token so the emailed link cannot be replayed.
+      await supabase.auth.admin.signOut(accessToken, 'global').catch(() => {})
+
+      res.json({ message: 'Password updated. Please sign in.' })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
 
 // ── GET /api/auth/csrf ──────────────────────────────────────────────────────────
 // Get CSRF token for mutations (cookie is set by global middleware)
