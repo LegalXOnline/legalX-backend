@@ -19,6 +19,7 @@ import consultationsRouter from './routes/consultations'
 import webhooksRouter from './routes/webhooks'
 import notificationsRouter from './routes/notifications'
 import uploadRouter from './routes/upload'
+import shortsRouter from './routes/shorts'
 
 // Extend Express Request type
 declare global {
@@ -208,6 +209,9 @@ app.use('/api/notifications', validateCsrf, notificationsRouter)
 // Phase 1.2: Auth endpoints get a stricter rate limit
 app.use('/api/auth', authRouter)
 app.use('/api/lawyers', lawyersRouter)
+
+// Public legal-shorts feed — read-only, no auth, safe to cache at the edge.
+app.use('/api/shorts', shortsRouter)
 
 // Protected routes with CSRF validation
 app.use('/api/leads', validateCsrf, leadsRouter)
