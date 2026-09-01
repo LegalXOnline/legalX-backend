@@ -22,9 +22,15 @@ import {
   adminArticleSchema,
   adminArticleUpdateSchema,
   uuidParamSchema,
+  shortsIngestSchema,
+  shortsUpdateSchema,
+  shortsAutoIngestSchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
+import { summariseJudgment, slugify } from '../lib/llm'
+import { runAutoIngest } from '../lib/shortsPipeline'
+import { FEEDS } from '../lib/sources/indiankanoon'
 
 const router = Router()
 
@@ -1263,6 +1269,205 @@ router.patch('/articles/:id', requireAdmin, validateParams(uuidParamSchema), val
     })
 
     return res.json({ message: 'Article updated' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── Legal shorts ──────────────────────────────────────────────────────────────
+
+// ── POST /api/admin/shorts/ingest ────────────────────────────────────────────
+// Summarises a pasted judgment into a draft card.
+//
+// The operator supplies the text rather than a scraper fetching it: every
+// official portal (sci.gov.in, judgments.ecourts.gov.in) gates search behind a
+// captcha. Section 52(1)(q)(iv) exempts judgments from copyright, but that is
+// not permission to defeat an access control — so a human fetches the judgment
+// as an ordinary visitor and pastes it here.
+router.post('/shorts/ingest', requireAdmin, validateBody(shortsIngestSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { sourceUrl, rawText, court, judgmentDate } = req.body
+
+    const { data: existing } = await supabase
+      .from('shorts_cards').select('id, title, is_published').eq('source_url', sourceUrl).maybeSingle()
+    if (existing) {
+      return res.status(409).json({
+        error: 'This judgment has already been ingested.',
+        existing: { id: existing.id, title: existing.title, isPublished: existing.is_published },
+      })
+    }
+
+    const summary = await summariseJudgment(rawText)
+
+    const { data: card, error } = await supabase
+      .from('shorts_cards')
+      .insert({
+        title: summary.title,
+        slug: slugify(summary.title, Math.abs(hashString(sourceUrl)).toString(36).slice(0, 6)),
+        summary: summary.summary,
+        takeaway: summary.takeaway || null,
+        category: summary.category,
+        court: court || summary.court,
+        judgment_date: judgmentDate ?? null,
+        source_url: sourceUrl,
+        tags: summary.tags,
+        // Never auto-publish. An AI summary of case law goes out under the
+        // LegalX name only after a person has read it.
+        is_published: false,
+        raw_source: { text: rawText.slice(0, 200_000), ingested_by: (req as any).user.id },
+      })
+      .select('id, title, slug, summary, takeaway, category, court, tags, source_url, is_published, created_at')
+      .single()
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: 'INGEST_SHORT', entityType: 'short', entityId: card.id,
+      after: { sourceUrl, title: card.title, category: card.category },
+    })
+
+    return res.status(201).json({ short: card })
+  } catch (err: any) {
+    // Surface configuration and rate-limit problems to the operator — they are
+    // actionable, unlike a generic 500.
+    if (/not configured|rate limit|too short|malformed|empty response/i.test(err?.message ?? '')) {
+      return res.status(422).json({ error: err.message })
+    }
+    next(err)
+  }
+})
+
+// ── POST /api/admin/shorts/auto-ingest ───────────────────────────────────────
+// Manual "run now" from the admin portal. The scheduled job hits the identical
+// pipeline through /api/jobs/shorts-daily, which is secret-authenticated and
+// outside the CSRF-protected admin router.
+router.post('/shorts/auto-ingest', requireAdmin, validateBody(shortsAutoIngestSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { feed, limit } = req.body
+    const result = await runAutoIngest(feed, limit)
+
+    await writeAudit(req, {
+      action: 'AUTO_INGEST_SHORTS', entityType: 'short', entityId: null,
+      after: { feed, created: result.created, failed: result.failed },
+    })
+
+    return res.json(result)
+  } catch (err: any) {
+    if (/not configured|rejected the API key|rate limit|Unknown feed/i.test(err?.message ?? '')) {
+      return res.status(422).json({ error: err.message })
+    }
+    next(err)
+  }
+})
+
+// ── GET /api/admin/shorts/feeds ──────────────────────────────────────────────
+router.get('/shorts/feeds', requireAdmin, (_req: Request, res: Response) => {
+  res.json({
+    feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, label: f.label, withinDays: f.withinDays ?? null })),
+  })
+})
+
+/** Small deterministic hash — only used to disambiguate slugs. */
+function hashString(input: string): number {
+  let hash = 0
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash << 5) - hash + input.charCodeAt(i)
+    hash |= 0
+  }
+  return hash
+}
+
+// ── GET /api/admin/shorts ────────────────────────────────────────────────────
+// Review queue. `status=draft` (default) is the work list; oldest first.
+router.get('/shorts', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status = 'draft', search, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('shorts_cards')
+      .select('id, title, slug, summary, takeaway, category, court, judgment_date, source_url, tags, is_published, published_at, likes_count, created_at', { count: 'exact' })
+
+    if (status === 'draft') query = query.eq('is_published', false)
+    else if (status === 'published') query = query.eq('is_published', true)
+
+    if (search) {
+      const term = escapeLike(search)
+      if (term) query = query.or(`title.ilike.%${term}%,category.ilike.%${term}%`)
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: status === 'draft' })
+      .range(from, to)
+    if (error) throw error
+
+    res.json({ shorts: data ?? [], total: count ?? 0, page, pageSize })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── PATCH /api/admin/shorts/:id ──────────────────────────────────────────────
+// Edit and/or publish. Editing before publishing is expected — the summary is a
+// draft written by a model, not finished copy.
+router.patch('/shorts/:id', requireAdmin, validateParams(uuidParamSchema), validateBody(shortsUpdateSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { data: prev } = await supabase
+      .from('shorts_cards').select('title, is_published').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Short not found' })
+
+    const body = req.body
+    const update: Record<string, unknown> = { updated_at: new Date().toISOString() }
+    if (body.title !== undefined) update.title = body.title
+    if (body.summary !== undefined) update.summary = body.summary
+    if (body.takeaway !== undefined) update.takeaway = body.takeaway
+    if (body.category !== undefined) update.category = body.category
+    if (body.court !== undefined) update.court = body.court
+    if (body.judgmentDate !== undefined) update.judgment_date = body.judgmentDate
+    if (body.tags !== undefined) update.tags = body.tags
+
+    if (body.isPublished !== undefined) {
+      update.is_published = body.isPublished
+      // Stamp the reviewer on the draft -> published transition only, so a
+      // later edit doesn't overwrite who originally approved it.
+      if (body.isPublished && !prev.is_published) {
+        update.published_at = new Date().toISOString()
+        update.reviewed_by = (req as any).user.id
+      }
+    }
+
+    const { error } = await supabase.from('shorts_cards').update(update).eq('id', id)
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: body.isPublished === true && !prev.is_published ? 'PUBLISH_SHORT' : 'UPDATE_SHORT',
+      entityType: 'short', entityId: id,
+      before: { title: prev.title, is_published: prev.is_published },
+      after: update,
+    })
+
+    return res.json({ message: body.isPublished ? 'Short published' : 'Short updated' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── DELETE /api/admin/shorts/:id ─────────────────────────────────────────────
+router.delete('/shorts/:id', requireAdmin, validateParams(uuidParamSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { data: prev } = await supabase
+      .from('shorts_cards').select('title, source_url').eq('id', id).maybeSingle()
+    if (!prev) return res.status(404).json({ error: 'Short not found' })
+
+    const { error } = await supabase.from('shorts_cards').delete().eq('id', id)
+    if (error) throw error
+
+    await writeAudit(req, {
+      action: 'DELETE_SHORT', entityType: 'short', entityId: id, before: prev,
+    })
+
+    return res.json({ message: 'Short deleted' })
   } catch (err) {
     next(err)
   }

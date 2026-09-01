@@ -178,6 +178,37 @@ export const uuidParamSchema = z.object({
   id: z.string().uuid(),
 })
 
+// ── Legal shorts ──────────────────────────────────────────────────────────────
+
+export const shortsIngestSchema = z.object({
+  // The official court URL this text came from. Stored as the public citation
+  // link and, being UNIQUE, doubles as the duplicate guard.
+  sourceUrl: z.string().url().max(1000),
+  // Pasted judgment text. Required — the official portals are captcha-gated, so
+  // an operator supplies the text rather than a scraper fetching it.
+  rawText: z.string().min(200, 'Paste at least 200 characters of the judgment').max(400_000),
+  court: z.string().max(150).trim().optional(),
+  judgmentDate: z.string().date().optional(),
+})
+
+export const shortsAutoIngestSchema = z.object({
+  feed: z.string().min(1).max(50),
+  // Capped: each document costs an Indian Kanoon call plus an LLM call, and
+  // the Groq free tier is 8,000 tokens/minute.
+  limit: z.coerce.number().int().min(1).max(10).default(3),
+})
+
+export const shortsUpdateSchema = z.object({
+  title: z.string().min(3).max(255).trim().optional(),
+  summary: z.string().min(10).max(5000).trim().optional(),
+  takeaway: z.string().max(2000).trim().optional(),
+  category: z.string().max(100).trim().optional(),
+  court: z.string().max(150).trim().optional(),
+  judgmentDate: z.string().date().optional(),
+  tags: z.array(z.string().max(40)).max(8).optional(),
+  isPublished: z.boolean().optional(),
+})
+
 export function validateBody<T extends z.ZodType>(schema: T) {
   return (req: Request, res: Response, next: NextFunction) => {
     const result = schema.safeParse(req.body)
