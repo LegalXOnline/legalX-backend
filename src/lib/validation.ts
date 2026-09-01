@@ -68,7 +68,11 @@ export const authForgotPasswordSchema = z.object({
 })
 
 export const authResetPasswordSchema = z.object({
-  accessToken: z.string().min(20).max(4096),
+  email: z.string().email().max(255).trim().toLowerCase(),
+  // Supabase currently issues 8-digit recovery codes, but MAILER_OTP_LENGTH is
+  // configurable — accept the whole supported range so a dashboard change
+  // cannot silently break resets.
+  otp: z.string().trim().regex(/^\d{6,10}$/, 'Enter the code from your email'),
   password: strongPasswordSchema,
 })
 

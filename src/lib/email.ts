@@ -372,15 +372,21 @@ export async function sendLawyerOnboardingWelcome(email: string, firstName: stri
 }
 
 // ── Password reset ────────────────────────────────────────────────────────────
-// Delivered through Resend rather than Supabase's built-in mailer, which is
-// rate-limited to a handful of messages per hour and unusable in production.
-export async function sendPasswordResetEmail(email: string, resetLink: string, firstName?: string) {
+// Sends a one-time code rather than a clickable link. Mail providers (Gmail,
+// Outlook, corporate scanners) pre-fetch links to check them for malware, and
+// because Supabase recovery links are single-use that pre-fetch consumes the
+// token — the real user then lands on an "expired" page having clicked nothing.
+// A code cannot be consumed by a scanner.
+//
+// Delivered through Resend, not Supabase's built-in mailer, which is capped at
+// a handful of messages per hour and unusable in production.
+export async function sendPasswordResetEmail(email: string, otp: string, firstName?: string) {
   const greeting = firstName ? `Hi ${firstName},` : 'Hi,'
   try {
     await resend.emails.send({
       from: FROM,
       to: email,
-      subject: 'Reset Your LegalX Password',
+      subject: `${otp} is your LegalX password reset code`,
       html: `
         <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
           <div style="text-align:center;margin-bottom:28px">
@@ -390,27 +396,25 @@ export async function sendPasswordResetEmail(email: string, resetLink: string, f
             <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
           </div>
 
-          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Reset your password</h2>
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Your password reset code</h2>
           <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
-            ${greeting} we received a request to reset the password for your LegalX account.
-            Click the button below to choose a new one.
+            ${greeting} we received a request to reset the password for your LegalX
+            account. Enter the code below to choose a new password.
           </p>
 
-          <a href="${resetLink}"
-             style="display:inline-block;background:#C9A227;color:#fff;font-weight:700;padding:13px 30px;border-radius:8px;text-decoration:none;font-size:14px">
-            Reset My Password
-          </a>
-
-          <div style="background:#F9F6EF;border-left:4px solid #C9A227;padding:14px 18px;border-radius:4px;margin:28px 0 20px">
-            <p style="margin:0;color:#7A6010;font-size:13px;line-height:1.6">
-              This link expires in <strong>1 hour</strong> and can only be used once.
+          <div style="background:#F9F6EF;border:1px solid #E8DCC0;border-radius:10px;padding:24px;text-align:center;margin:0 0 24px">
+            <p style="margin:0 0 10px;color:#7A6010;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px">
+              Reset Code
+            </p>
+            <p style="margin:0;color:#111;font-size:34px;font-weight:800;letter-spacing:9px;font-family:'Courier New',monospace">
+              ${otp}
             </p>
           </div>
 
-          <p style="color:#888;font-size:13px;line-height:1.6;margin:0 0 6px">
-            If the button doesn't work, paste this into your browser:
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
+            This code expires in <strong>1 hour</strong> and can only be used once.
+            Never share it with anyone — LegalX staff will never ask you for it.
           </p>
-          <p style="color:#C9A227;font-size:12px;word-break:break-all;margin:0">${resetLink}</p>
 
           <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE">
             <p style="color:#888;font-size:12px;line-height:1.6;margin:0">

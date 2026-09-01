@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { isProduction, resolveAppOrigin } from '../lib/env'
-import { supabase, supabaseAuth, supabaseAuthValidator } from '../lib/supabase'
+import { supabase, supabaseAuth, supabaseAnon } from '../lib/supabase'
 import { sendWelcomeEmail, sendLawyerOnboardingWelcome, sendPasswordResetEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import {
@@ -25,6 +25,44 @@ const passwordResetLimiter = rateLimit({
   validate: { xForwardedForHeader: isProduction },
   message: { error: 'Too many password reset attempts. Please wait 15 minutes and try again.' },
 })
+
+// ── OTP brute-force guard ─────────────────────────────────────────────────────
+// The IP limiter above does not stop an attacker rotating IPs against one
+// mailbox, so failures are also counted per email address. In-memory is
+// sufficient here: the API runs as a single Render instance. If it is ever
+// scaled to multiple instances this must move to a shared store, or each
+// instance will keep its own independent (and therefore weaker) count.
+const OTP_MAX_ATTEMPTS = 5
+const OTP_ATTEMPT_WINDOW_MS = 15 * 60 * 1000
+const otpAttempts = new Map<string, { count: number; firstAt: number }>()
+
+function otpAttemptsExceeded(email: string): boolean {
+  const entry = otpAttempts.get(email)
+  if (!entry) return false
+  if (Date.now() - entry.firstAt > OTP_ATTEMPT_WINDOW_MS) {
+    otpAttempts.delete(email)
+    return false
+  }
+  return entry.count >= OTP_MAX_ATTEMPTS
+}
+
+function recordOtpFailure(email: string): void {
+  const entry = otpAttempts.get(email)
+  if (!entry || Date.now() - entry.firstAt > OTP_ATTEMPT_WINDOW_MS) {
+    otpAttempts.set(email, { count: 1, firstAt: Date.now() })
+    return
+  }
+  entry.count += 1
+}
+
+// Prune expired entries so a spray of unique addresses cannot grow the map
+// without bound.
+setInterval(() => {
+  const cutoff = Date.now() - OTP_ATTEMPT_WINDOW_MS
+  for (const [email, entry] of otpAttempts) {
+    if (entry.firstAt < cutoff) otpAttempts.delete(email)
+  }
+}, 5 * 60 * 1000).unref()
 
 // ── POST /api/auth/signup ─────────────────────────────────────────────────────
 router.post('/signup', validateBody(authSignupSchema), async (req: Request, res: Response, next: NextFunction) => {
@@ -233,34 +271,36 @@ router.post(
   validateBody(authForgotPasswordSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { email, origin } = req.body
-      const redirectTo = `${resolveAppOrigin(origin, req.get('origin'))}/reset-password`
+      const { email } = req.body
 
-      // Generate the recovery link ourselves and deliver it via Resend.
-      // Supabase's built-in mailer caps out at a few messages per hour, which
-      // would silently drop resets for real users.
+      // generateLink mints a recovery token and returns its one-time code
+      // without sending anything, so we can deliver the code through Resend.
+      // The action_link it also returns is deliberately unused — see the note
+      // in sendPasswordResetEmail about scanners consuming single-use links.
       const { data, error } = await supabase.auth.admin.generateLink({
         type: 'recovery',
         email,
-        options: { redirectTo },
+        options: { redirectTo: `${resolveAppOrigin(req.body.origin, req.get('origin'))}/reset-password` },
       })
 
-      const actionLink = data?.properties?.action_link
-      if (error || !actionLink) {
+      const otp = data?.properties?.email_otp
+      if (error || !otp) {
         // Logged, never returned — the caller must not learn why this failed
         // (the usual cause is simply that no such account exists).
         logger.warn({ reqId: req.id, err: error?.message }, 'generateLink recovery failed')
       } else {
+        // A fresh code was issued, so any earlier failed attempts are moot.
+        otpAttempts.delete(email)
         // Fire-and-forget: awaiting Resend would make responses measurably
         // slower for registered addresses, reintroducing an enumeration oracle.
         sendPasswordResetEmail(
           email,
-          actionLink,
+          otp,
           data.user?.user_metadata?.first_name as string | undefined
         ).catch(err => logger.error({ reqId: req.id, err }, 'password reset email failed'))
       }
 
-      res.json({ message: 'If an account exists for that email, a reset link is on its way.' })
+      res.json({ message: 'If an account exists for that email, a reset code is on its way.' })
     } catch (err) {
       next(err)
     }
@@ -276,25 +316,45 @@ router.post(
   validateBody(authResetPasswordSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { accessToken, password } = req.body
+      const { email, otp, password } = req.body
 
-      // Validate on the isolated validator client so the recovery JWT never
-      // becomes session context on the primary (DB/storage) client.
-      const { data, error } = await supabaseAuthValidator.auth.getUser(accessToken)
+      if (otpAttemptsExceeded(email)) {
+        res.status(429).json({
+          error: 'Too many incorrect codes. Request a new code and try again.',
+        })
+        return
+      }
+
+      // Verify on the anon client: this is a public auth operation, and it
+      // keeps the recovery session off the primary (DB/storage) client.
+      const { data, error } = await supabaseAnon.auth.verifyOtp({
+        email,
+        token: otp,
+        type: 'recovery',
+      })
+
       if (error || !data.user) {
-        res.status(401).json({ error: 'This reset link has expired. Please request a new one.' })
+        recordOtpFailure(email)
+        logger.warn({ reqId: req.id, err: error?.message }, 'recovery OTP verification failed')
+        res.status(401).json({ error: 'That code is incorrect or has expired. Please request a new one.' })
         return
       }
 
       const { error: updateError } = await supabase.auth.admin.updateUserById(data.user.id, { password })
       if (updateError) {
         logger.error({ reqId: req.id, err: updateError.message }, 'updateUserById password reset failed')
-        res.status(400).json({ error: 'Could not update your password. Please request a new reset link.' })
+        res.status(400).json({ error: 'Could not update your password. Please request a new code.' })
         return
       }
 
-      // Burn the recovery token so the emailed link cannot be replayed.
-      await supabase.auth.admin.signOut(accessToken, 'global').catch(() => {})
+      otpAttempts.delete(email)
+
+      // Drop every existing session, including the one verifyOtp just issued.
+      // A password reset is the standard response to a suspected compromise,
+      // so any attacker still holding a token must be logged out too.
+      if (data.session?.access_token) {
+        await supabase.auth.admin.signOut(data.session.access_token, 'global').catch(() => {})
+      }
 
       res.json({ message: 'Password updated. Please sign in.' })
     } catch (err) {
