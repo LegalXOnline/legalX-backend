@@ -27,22 +27,32 @@ export const supabaseAuthValidator = createClient(url, serviceKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
 
-/**
- * Alias kept for backward compat — same as supabase (service role).
- */
-export const supabaseAuth = supabase
+const anonKey = process.env.SUPABASE_ANON_KEY
+if (!anonKey) {
+  console.warn('[supabase] SUPABASE_ANON_KEY is not set — password reset and login will not work correctly')
+}
 
 /**
  * ANON client — for auth operations that must run as an unauthenticated end
- * user. Currently only verifyOtp() during password recovery: that call is
- * defined against the public anon role, and running it here keeps the
- * recovery session off the primary client entirely.
+ * user (verifyOtp during password recovery).
  */
-const anonKey = process.env.SUPABASE_ANON_KEY
-if (!anonKey) {
-  console.warn('[supabase] SUPABASE_ANON_KEY is not set — password reset OTP verification will not work')
-}
-
 export const supabaseAnon = createClient(url, anonKey || serviceKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+})
+
+/**
+ * SIGN-IN client — used ONLY for signInWithPassword.
+ *
+ * This must never be the service-role client. signInWithPassword stores the
+ * returned session on whichever client made the call (persistSession: false
+ * only stops it being written to disk, not held in memory), and supabase-js
+ * then sends that user's JWT as the Authorization header on every subsequent
+ * request from that client. Calling it on the primary client therefore
+ * downgrades all later DB reads from service_role to that one user, silently
+ * applying RLS and making rows disappear until the process restarts.
+ *
+ * Kept as its own instance so a login cannot disturb the recovery flow either.
+ */
+export const supabaseSignIn = createClient(url, anonKey || serviceKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
