@@ -53,6 +53,25 @@ export const authLoginSchema = z.object({
   password: z.string().min(1).max(128),
 })
 
+/** Mirrors the client-side rule shown on /reset-password: 8+ chars, 1 uppercase, 1 number. */
+const strongPasswordSchema = z
+  .string()
+  .min(8, 'Password must be at least 8 characters')
+  .max(128)
+  .regex(/[A-Z]/, 'Password must contain an uppercase letter')
+  .regex(/[0-9]/, 'Password must contain a number')
+
+export const authForgotPasswordSchema = z.object({
+  email: z.string().email().max(255).trim().toLowerCase(),
+  // Untrusted — checked against the origin allowlist before use.
+  origin: z.string().max(255).optional(),
+})
+
+export const authResetPasswordSchema = z.object({
+  accessToken: z.string().min(20).max(4096),
+  password: strongPasswordSchema,
+})
+
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),
 })
