@@ -1,0 +1,67 @@
+name: Daily Legal Shorts
+
+# Free on GitHub Actions: this runs ~2 minutes a day against the 2,000
+# minutes/month allowance for private repositories.
+on:
+  schedule:
+    # 02:30 UTC = 08:00 IST — drafts are waiting when the team starts the day.
+    # Cron on GitHub can drift by several minutes under load; that is fine here.
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'How many drafts to create'
+        required: false
+        default: '5'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake the backend
+        # Render's free tier sleeps after 15 minutes idle and takes ~50s to
+        # start. Waking it first stops the real request timing out.
+        run: |
+          curl -s -o /dev/null -m 90 --retry 3 --retry-delay 20 \
+            "${{ secrets.BACKEND_URL }}/health" || true
+
+      - name: Check job credentials and configuration
+        run: |
+          response=$(curl -s -w '\n%{http_code}' -m 60 \
+            -H "x-admin-secret: ${{ secrets.ADMIN_SECRET }}" \
+            "${{ secrets.BACKEND_URL }}/api/jobs/health")
+          body=$(echo "$response" | head -n -1)
+          code=$(echo "$response" | tail -n 1)
+          echo "$body"
+          if [ "$code" != "200" ]; then
+            echo "::error::Job health check failed with HTTP $code"
+            exit 1
+          fi
+          # Fail loudly rather than silently producing nothing all week.
+          echo "$body" | grep -q '"indiankanoon":true' || { echo "::error::INDIANKANOON_API_KEY not set on the backend"; exit 1; }
+          echo "$body" | grep -q '"summariser":true'   || { echo "::error::No summariser key set on the backend"; exit 1; }
+
+      - name: Ingest today's shorts
+        run: |
+          target='${{ github.event.inputs.target }}'
+          [ -z "$target" ] && target=5
+          response=$(curl -s -w '\n%{http_code}' -m 540 -X POST \
+            -H "x-admin-secret: ${{ secrets.ADMIN_SECRET }}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"target\":$target}" \
+            "${{ secrets.BACKEND_URL }}/api/jobs/shorts-daily")
+          body=$(echo "$response" | head -n -1)
+          code=$(echo "$response" | tail -n 1)
+          echo "$body"
+          if [ "$code" != "200" ]; then
+            echo "::error::Ingest failed with HTTP $code"
+            exit 1
+          fi
+          created=$(echo "$body" | grep -o '"created":[0-9]*' | head -1 | cut -d: -f2)
+          echo "::notice::Created ${created:-0} draft shorts — review them at /admin/shorts"
+          # Zero drafts is not an error (everything may already be ingested),
+          # but it should be visible in the run summary.
+          if [ "${created:-0}" = "0" ]; then
+            echo "::warning::No new drafts were created today"
+          fi

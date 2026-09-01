@@ -20,6 +20,7 @@ import webhooksRouter from './routes/webhooks'
 import notificationsRouter from './routes/notifications'
 import uploadRouter from './routes/upload'
 import shortsRouter from './routes/shorts'
+import jobsRouter from './routes/jobs'
 
 // Extend Express Request type
 declare global {
@@ -212,6 +213,10 @@ app.use('/api/lawyers', lawyersRouter)
 
 // Public legal-shorts feed — read-only, no auth, safe to cache at the edge.
 app.use('/api/shorts', shortsRouter)
+
+// Scheduled-job endpoints — secret-authenticated, deliberately outside the
+// CSRF-protected routers (see the note in routes/jobs.ts).
+app.use('/api/jobs', jobsRouter)
 
 // Protected routes with CSRF validation
 app.use('/api/leads', validateCsrf, leadsRouter)
