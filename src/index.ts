@@ -154,7 +154,13 @@ app.use(rateLimit({
 }))
 
 
-app.use(express.json({ limit: '1mb' }))
+// Keep the raw bytes around for webhook signature verification. Razorpay signs
+// the exact payload it sent; re-serialising the parsed object would change key
+// order and whitespace and never match.
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buf) => { (req as any).rawBody = buf },
+}))
 
 
 // ── Health check ─────────────────────────────────────────────────────────────
@@ -193,8 +199,10 @@ app.get('/health', async (_req, res) => {
 app.use('/api/webhooks', webhooksRouter)
 app.use('/api/upload', validateCsrf, uploadRouter)
 
-// SSE notification stream — GET only, auth via cookie, no CSRF needed
-app.use('/api/notifications', notificationsRouter)
+// Notifications: the SSE stream and list are GETs, which validateCsrf skips,
+// so mark-read mutations are still protected without breaking EventSource
+// (which cannot send custom headers).
+app.use('/api/notifications', validateCsrf, notificationsRouter)
 
 // Public routes that don't need CSRF (login, signup, public lawyer directory)
 // Phase 1.2: Auth endpoints get a stricter rate limit
