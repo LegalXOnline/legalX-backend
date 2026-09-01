@@ -24,13 +24,13 @@ import {
   uuidParamSchema,
   shortsIngestSchema,
   shortsUpdateSchema,
+  shortsBulkSchema,
   shortsAutoIngestSchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
-import { summariseJudgment, slugify } from '../lib/llm'
-import { runAutoIngest } from '../lib/shortsPipeline'
-import { FEEDS } from '../lib/sources/indiankanoon'
+import { runIngest, draftFromSource } from '../lib/shortsPipeline'
+import { FEED_SOURCES } from '../lib/sources/rss'
 
 const router = Router()
 
@@ -1277,59 +1277,28 @@ router.patch('/articles/:id', requireAdmin, validateParams(uuidParamSchema), val
 // ── Legal shorts ──────────────────────────────────────────────────────────────
 
 // ── POST /api/admin/shorts/ingest ────────────────────────────────────────────
-// Summarises a pasted judgment into a draft card.
-//
-// The operator supplies the text rather than a scraper fetching it: every
-// official portal (sci.gov.in, judgments.ecourts.gov.in) gates search behind a
-// captcha. Section 52(1)(q)(iv) exempts judgments from copyright, but that is
-// not permission to defeat an access control — so a human fetches the judgment
-// as an ordinary visitor and pastes it here.
+// Operator-supplied source: a URL to fetch, or text pasted directly for pages
+// the fetcher cannot read (PDFs, captcha-gated court portals). Produces one
+// pending suggestion — never publishes.
 router.post('/shorts/ingest', requireAdmin, validateBody(shortsIngestSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sourceUrl, rawText, court, judgmentDate } = req.body
+    const { sourceUrl, rawText, sourceName } = req.body
+    const result = await draftFromSource({ sourceUrl, rawText, sourceName })
 
-    const { data: existing } = await supabase
-      .from('shorts_cards').select('id, title, is_published').eq('source_url', sourceUrl).maybeSingle()
-    if (existing) {
-      return res.status(409).json({
-        error: 'This judgment has already been ingested.',
-        existing: { id: existing.id, title: existing.title, isPublished: existing.is_published },
-      })
+    if ('skipped' in result) {
+      // A refusal is a successful outcome of the grounding contract, not an
+      // error — say why so the operator can judge whether to paste more text.
+      return res.status(422).json({ error: `Not summarised: ${result.reason}` })
     }
 
-    const summary = await summariseJudgment(rawText)
-
-    const { data: card, error } = await supabase
-      .from('shorts_cards')
-      .insert({
-        title: summary.title,
-        slug: slugify(summary.title, Math.abs(hashString(sourceUrl)).toString(36).slice(0, 6)),
-        summary: summary.summary,
-        takeaway: summary.takeaway || null,
-        category: summary.category,
-        court: court || summary.court,
-        judgment_date: judgmentDate ?? null,
-        source_url: sourceUrl,
-        tags: summary.tags,
-        // Never auto-publish. An AI summary of case law goes out under the
-        // LegalX name only after a person has read it.
-        is_published: false,
-        raw_source: { text: rawText.slice(0, 200_000), ingested_by: (req as any).user.id },
-      })
-      .select('id, title, slug, summary, takeaway, category, court, tags, source_url, is_published, created_at')
-      .single()
-    if (error) throw error
-
     await writeAudit(req, {
-      action: 'INGEST_SHORT', entityType: 'short', entityId: card.id,
-      after: { sourceUrl, title: card.title, category: card.category },
+      action: 'INGEST_SHORT', entityType: 'short', entityId: result.id,
+      after: { sourceUrl, title: result.title },
     })
 
-    return res.status(201).json({ short: card })
+    return res.status(201).json({ short: result })
   } catch (err: any) {
-    // Surface configuration and rate-limit problems to the operator — they are
-    // actionable, unlike a generic 500.
-    if (/not configured|rate limit|too short|malformed|empty response/i.test(err?.message ?? '')) {
+    if (/not configured|rate limit|Already ingested|Could not fetch|is a PDF/i.test(err?.message ?? '')) {
       return res.status(422).json({ error: err.message })
     }
     next(err)
@@ -1337,22 +1306,20 @@ router.post('/shorts/ingest', requireAdmin, validateBody(shortsIngestSchema), as
 })
 
 // ── POST /api/admin/shorts/auto-ingest ───────────────────────────────────────
-// Manual "run now" from the admin portal. The scheduled job hits the identical
-// pipeline through /api/jobs/shorts-daily, which is secret-authenticated and
-// outside the CSRF-protected admin router.
+// Manual "run now". Proposes a batch of suggestions for review; the scheduled
+// job hits the same pipeline via /api/jobs/shorts-daily.
 router.post('/shorts/auto-ingest', requireAdmin, validateBody(shortsAutoIngestSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { feed, limit } = req.body
-    const result = await runAutoIngest(feed, limit)
+    const report = await runIngest({ target: req.body.limit, feeds: req.body.feeds })
 
     await writeAudit(req, {
-      action: 'AUTO_INGEST_SHORTS', entityType: 'short', entityId: null,
-      after: { feed, created: result.created, failed: result.failed },
+      action: 'INGEST_SHORTS', entityType: 'short', entityId: null,
+      after: { proposed: report.proposed, skipped: report.skipped.length, failed: report.failed.length },
     })
 
-    return res.json(result)
+    return res.json(report)
   } catch (err: any) {
-    if (/not configured|rejected the API key|rate limit|Unknown feed/i.test(err?.message ?? '')) {
+    if (/not configured|rate limit|No feed sources/i.test(err?.message ?? '')) {
       return res.status(422).json({ error: err.message })
     }
     next(err)
@@ -1362,45 +1329,103 @@ router.post('/shorts/auto-ingest', requireAdmin, validateBody(shortsAutoIngestSc
 // ── GET /api/admin/shorts/feeds ──────────────────────────────────────────────
 router.get('/shorts/feeds', requireAdmin, (_req: Request, res: Response) => {
   res.json({
-    feeds: Object.entries(FEEDS).map(([id, f]) => ({ id, label: f.label, withinDays: f.withinDays ?? null })),
+    feeds: FEED_SOURCES.map(f => ({
+      id: f.id, label: f.label, enabled: f.enabled,
+      sourceName: f.sourceName, licenceNote: f.licenceNote,
+    })),
   })
 })
 
-/** Small deterministic hash — only used to disambiguate slugs. */
-function hashString(input: string): number {
-  let hash = 0
-  for (let i = 0; i < input.length; i++) {
-    hash = (hash << 5) - hash + input.charCodeAt(i)
-    hash |= 0
+// ── POST /api/admin/shorts/bulk ──────────────────────────────────────────────
+// The core curation action: approve the 3-4 worth publishing, reject the rest.
+// Rejected cards are kept so the same article is not re-suggested tomorrow.
+router.post('/shorts/bulk', requireAdmin, validateBody(shortsBulkSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { ids, action, reason } = req.body
+    const now = new Date().toISOString()
+
+    const update = action === 'approve'
+      ? { review_status: 'approved', is_published: true, published_at: now, reviewed_by: (req as any).user.id, updated_at: now }
+      : { review_status: 'rejected', is_published: false, rejected_reason: reason ?? null, reviewed_by: (req as any).user.id, updated_at: now }
+
+    const { data, error } = await supabase
+      .from('shorts_cards')
+      .update(update)
+      .in('id', ids)
+      .eq('review_status', 'pending')   // never re-decide something already actioned
+      .select('id')
+    if (error) throw error
+
+    const changed = (data ?? []).map(r => r.id)
+
+    await writeAudit(req, {
+      action: action === 'approve' ? 'PUBLISH_SHORTS' : 'REJECT_SHORTS',
+      entityType: 'short', entityId: null,
+      before: { requested: ids },
+      after: { changed, reason: reason ?? null },
+    })
+
+    return res.json({
+      changed: changed.length,
+      skipped: ids.length - changed.length,
+    })
+  } catch (err) {
+    next(err)
   }
-  return hash
-}
+})
 
 // ── GET /api/admin/shorts ────────────────────────────────────────────────────
-// Review queue. `status=draft` (default) is the work list; oldest first.
+// The curation queue. `status=pending` (default) is the work list, ordered by
+// relevance so the strongest suggestions are read first.
 router.get('/shorts', requireAdmin, validateQuery(adminListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { status = 'draft', search, page, pageSize } = req.validatedQuery as any
+    const { status = 'pending', search, page, pageSize } = req.validatedQuery as any
     const [from, to] = pageRange(page, pageSize)
 
     let query = supabase
       .from('shorts_cards')
-      .select('id, title, slug, summary, takeaway, category, court, judgment_date, source_url, tags, is_published, published_at, likes_count, created_at', { count: 'exact' })
+      .select(
+        'id, title, slug, summary, takeaway, category, court, judgment_date, source_url, source_name, ' +
+        'source_feed, tags, evidence, relevance_score, confidence, is_published, review_status, ' +
+        'rejected_reason, published_at, likes_count, created_at',
+        { count: 'exact' }
+      )
 
-    if (status === 'draft') query = query.eq('is_published', false)
-    else if (status === 'published') query = query.eq('is_published', true)
+    if (['pending', 'approved', 'rejected'].includes(status)) {
+      query = query.eq('review_status', status)
+    }
 
     if (search) {
       const term = escapeLike(search)
       if (term) query = query.or(`title.ilike.%${term}%,category.ilike.%${term}%`)
     }
 
-    const { data, error, count } = await query
-      .order('created_at', { ascending: status === 'draft' })
-      .range(from, to)
+    // Pending: best candidates first. Everything else: newest first.
+    query = status === 'pending'
+      ? query.order('relevance_score', { ascending: false }).order('created_at', { ascending: false })
+      : query.order('created_at', { ascending: false })
+
+    const { data, error, count } = await query.range(from, to)
     if (error) throw error
 
-    res.json({ shorts: data ?? [], total: count ?? 0, page, pageSize })
+    // Counts for the tab badges, so the editor sees the backlog at a glance.
+    const [pendingRes, approvedRes, rejectedRes] = await Promise.all([
+      supabase.from('shorts_cards').select('id', { count: 'exact', head: true }).eq('review_status', 'pending'),
+      supabase.from('shorts_cards').select('id', { count: 'exact', head: true }).eq('review_status', 'approved'),
+      supabase.from('shorts_cards').select('id', { count: 'exact', head: true }).eq('review_status', 'rejected'),
+    ])
+
+    res.json({
+      shorts: data ?? [],
+      total: count ?? 0,
+      page,
+      pageSize,
+      counts: {
+        pending: pendingRes.count ?? 0,
+        approved: approvedRes.count ?? 0,
+        rejected: rejectedRes.count ?? 0,
+      },
+    })
   } catch (err) {
     next(err)
   }

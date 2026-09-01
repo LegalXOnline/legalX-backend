@@ -1,8 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
-import { runAutoIngest } from '../lib/shortsPipeline'
-import { FEEDS } from '../lib/sources/indiankanoon'
+import { runIngest } from '../lib/shortsPipeline'
+import { FEED_SOURCES } from '../lib/sources/rss'
 
 const router = Router()
 
@@ -39,43 +39,29 @@ function requireJobSecret(req: Request, res: Response, next: NextFunction) {
 }
 
 // ── POST /api/jobs/shorts-daily ──────────────────────────────────────────────
-// Run by the scheduled workflow once a day. Walks the configured feeds until it
-// has produced the day's target number of draft cards, then stops.
+// Run by the scheduled workflow once a day. Proposes a batch of suggestions
+// from the enabled feeds for an editor to curate.
 //
-// Cards are created unpublished. Nothing reaches the public feed without a
-// human approving it in the admin portal.
+// Cards are created pending. Nothing reaches the public feed without a human
+// approving it in the admin portal.
 router.post('/shorts-daily', requireJobSecret, async (req: Request, res: Response) => {
-  const target = Math.min(Math.max(Number(req.body?.target) || 5, 1), 15)
+  // Propose more than will be published — the editor keeps the best few.
+  const target = Math.min(Math.max(Number(req.body?.target) || 8, 1), 20)
 
-  // Rotate through feeds so the daily mix isn't five Supreme Court cases in a
-  // row — a couple of judgments plus practical citizen-rights topics.
-  const order: string[] = Array.isArray(req.body?.feeds) && req.body.feeds.length
-    ? req.body.feeds.filter((f: string) => f in FEEDS)
-    : ['supreme_court', 'high_courts', 'consumer', 'traffic', 'employment', 'tenancy', 'bns']
-
-  const results: any[] = []
-  let created = 0
-
-  for (const feed of order) {
-    if (created >= target) break
-    try {
-      const remaining = target - created
-      // At most 2 per feed until the target is nearly met, so one noisy feed
-      // cannot fill the whole day.
-      const result = await runAutoIngest(feed, Math.min(remaining, 2))
-      created += result.created
-      results.push(result)
-    } catch (err: any) {
-      const message = err?.message ?? 'unknown'
-      logger.warn({ feed, err: message }, '[jobs] feed failed')
-      results.push({ feed, created: 0, failed: 0, error: message })
-      // Configuration and quota problems apply to every remaining feed too.
-      if (/not configured|rejected the API key|rate limit/i.test(message)) break
-    }
+  try {
+    const report = await runIngest({ target, feeds: req.body?.feeds })
+    logger.info(
+      { proposed: report.proposed, skipped: report.skipped.length, failed: report.failed.length },
+      '[jobs] shorts-daily complete'
+    )
+    res.json(report)
+  } catch (err: any) {
+    const message = err?.message ?? 'unknown'
+    logger.error({ err: message }, '[jobs] shorts-daily failed')
+    // 5xx so the scheduled run is marked failed and someone notices, rather
+    // than the feed quietly going stale for a week.
+    res.status(500).json({ error: message })
   }
-
-  logger.info({ created, target, feeds: results.length }, '[jobs] shorts-daily complete')
-  res.json({ created, target, results })
 })
 
 // ── GET /api/jobs/health ─────────────────────────────────────────────────────
@@ -84,10 +70,9 @@ router.post('/shorts-daily', requireJobSecret, async (req: Request, res: Respons
 router.get('/health', requireJobSecret, (_req: Request, res: Response) => {
   res.json({
     ok: true,
-    indiankanoon: !!process.env.INDIANKANOON_API_KEY,
     summariser: !!(process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY),
     provider: process.env.SHORTS_LLM_PROVIDER ?? 'groq',
-    feeds: Object.keys(FEEDS),
+    feeds: FEED_SOURCES.filter(f => f.enabled).map(f => f.id),
   })
 })
 

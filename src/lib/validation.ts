@@ -181,21 +181,27 @@ export const uuidParamSchema = z.object({
 // ── Legal shorts ──────────────────────────────────────────────────────────────
 
 export const shortsIngestSchema = z.object({
-  // The official court URL this text came from. Stored as the public citation
-  // link and, being UNIQUE, doubles as the duplicate guard.
+  // Public link to the source. Stored as the citation and, being UNIQUE,
+  // doubles as the duplicate guard.
   sourceUrl: z.string().url().max(1000),
-  // Pasted judgment text. Required — the official portals are captcha-gated, so
-  // an operator supplies the text rather than a scraper fetching it.
-  rawText: z.string().min(200, 'Paste at least 200 characters of the judgment').max(400_000),
-  court: z.string().max(150).trim().optional(),
-  judgmentDate: z.string().date().optional(),
+  // Optional: when omitted the backend fetches the URL. Required for PDFs and
+  // captcha-gated portals, where an operator pastes the text instead.
+  rawText: z.string().max(400_000).optional(),
+  sourceName: z.string().max(120).trim().optional(),
 })
 
 export const shortsAutoIngestSchema = z.object({
-  feed: z.string().min(1).max(50),
-  // Capped: each document costs an Indian Kanoon call plus an LLM call, and
-  // the Groq free tier is 8,000 tokens/minute.
-  limit: z.coerce.number().int().min(1).max(10).default(3),
+  feeds: z.array(z.string().max(50)).max(10).optional(),
+  // How many suggestions to propose. Deliberately more than will be published —
+  // the editor keeps the best few. Capped because each one costs an LLM call
+  // and the Groq free tier is 8,000 tokens/minute.
+  limit: z.coerce.number().int().min(1).max(20).default(8),
+})
+
+export const shortsBulkSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1, 'Select at least one').max(50),
+  action: z.enum(['approve', 'reject']),
+  reason: z.string().max(500).trim().optional(),
 })
 
 export const shortsUpdateSchema = z.object({

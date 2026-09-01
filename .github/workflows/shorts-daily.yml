@@ -1,4 +1,4 @@
-name: Daily Legal Shorts
+name: Daily Knowledge Center Ingest
 
 # Free on GitHub Actions: this runs ~2 minutes a day against the 2,000
 # minutes/month allowance for private repositories.
@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'How many drafts to create'
+        description: 'How many suggestions to propose'
         required: false
-        default: '5'
+        default: '8'
 
 jobs:
   ingest:
@@ -39,13 +39,12 @@ jobs:
             exit 1
           fi
           # Fail loudly rather than silently producing nothing all week.
-          echo "$body" | grep -q '"indiankanoon":true' || { echo "::error::INDIANKANOON_API_KEY not set on the backend"; exit 1; }
           echo "$body" | grep -q '"summariser":true'   || { echo "::error::No summariser key set on the backend"; exit 1; }
 
-      - name: Ingest today's shorts
+      - name: Propose today's suggestions
         run: |
           target='${{ github.event.inputs.target }}'
-          [ -z "$target" ] && target=5
+          [ -z "$target" ] && target=8
           response=$(curl -s -w '\n%{http_code}' -m 540 -X POST \
             -H "x-admin-secret: ${{ secrets.ADMIN_SECRET }}" \
             -H 'Content-Type: application/json' \
@@ -58,10 +57,10 @@ jobs:
             echo "::error::Ingest failed with HTTP $code"
             exit 1
           fi
-          created=$(echo "$body" | grep -o '"created":[0-9]*' | head -1 | cut -d: -f2)
-          echo "::notice::Created ${created:-0} draft shorts — review them at /admin/shorts"
-          # Zero drafts is not an error (everything may already be ingested),
-          # but it should be visible in the run summary.
-          if [ "${created:-0}" = "0" ]; then
-            echo "::warning::No new drafts were created today"
+          proposed=$(echo "$body" | grep -o '"proposed":[0-9]*' | head -1 | cut -d: -f2)
+          echo "::notice::Proposed ${proposed:-0} suggestions — curate them at /admin/shorts"
+          # Zero is not an error: everything may already be ingested, or the
+          # grounding checks may have rejected every candidate. Still surface it.
+          if [ "${proposed:-0}" = "0" ]; then
+            echo "::warning::No suggestions proposed today — check the skipped reasons in the response above"
           fi
