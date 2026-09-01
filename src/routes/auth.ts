@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { isProduction, resolveAppOrigin } from '../lib/env'
-import { supabase, supabaseAuth, supabaseAnon, supabaseAuthValidator } from '../lib/supabase'
-import { sendWelcomeEmail, sendLawyerOnboardingWelcome } from '../lib/email'
+import { supabase, supabaseAuth, supabaseAuthValidator } from '../lib/supabase'
+import { sendWelcomeEmail, sendLawyerOnboardingWelcome, sendPasswordResetEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import {
   validateBody,
@@ -236,10 +236,28 @@ router.post(
       const { email, origin } = req.body
       const redirectTo = `${resolveAppOrigin(origin, req.get('origin'))}/reset-password`
 
-      const { error } = await supabaseAnon.auth.resetPasswordForEmail(email, { redirectTo })
-      if (error) {
-        // Logged, never returned — the caller must not learn why this failed.
-        logger.warn({ reqId: req.id, err: error.message }, 'resetPasswordForEmail failed')
+      // Generate the recovery link ourselves and deliver it via Resend.
+      // Supabase's built-in mailer caps out at a few messages per hour, which
+      // would silently drop resets for real users.
+      const { data, error } = await supabase.auth.admin.generateLink({
+        type: 'recovery',
+        email,
+        options: { redirectTo },
+      })
+
+      const actionLink = data?.properties?.action_link
+      if (error || !actionLink) {
+        // Logged, never returned — the caller must not learn why this failed
+        // (the usual cause is simply that no such account exists).
+        logger.warn({ reqId: req.id, err: error?.message }, 'generateLink recovery failed')
+      } else {
+        // Fire-and-forget: awaiting Resend would make responses measurably
+        // slower for registered addresses, reintroducing an enumeration oracle.
+        sendPasswordResetEmail(
+          email,
+          actionLink,
+          data.user?.user_metadata?.first_name as string | undefined
+        ).catch(err => logger.error({ reqId: req.id, err }, 'password reset email failed'))
       }
 
       res.json({ message: 'If an account exists for that email, a reset link is on its way.' })

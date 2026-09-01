@@ -371,6 +371,65 @@ export async function sendLawyerOnboardingWelcome(email: string, firstName: stri
   }
 }
 
+// ── Password reset ────────────────────────────────────────────────────────────
+// Delivered through Resend rather than Supabase's built-in mailer, which is
+// rate-limited to a handful of messages per hour and unusable in production.
+export async function sendPasswordResetEmail(email: string, resetLink: string, firstName?: string) {
+  const greeting = firstName ? `Hi ${firstName},` : 'Hi,'
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'Reset Your LegalX Password',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <div style="text-align:center;margin-bottom:28px">
+            <h1 style="font-size:28px;font-weight:800;color:#111;letter-spacing:-0.5px;margin:0">
+              Legal<span style="color:#C9A227">X</span>
+            </h1>
+            <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
+          </div>
+
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Reset your password</h2>
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
+            ${greeting} we received a request to reset the password for your LegalX account.
+            Click the button below to choose a new one.
+          </p>
+
+          <a href="${resetLink}"
+             style="display:inline-block;background:#C9A227;color:#fff;font-weight:700;padding:13px 30px;border-radius:8px;text-decoration:none;font-size:14px">
+            Reset My Password
+          </a>
+
+          <div style="background:#F9F6EF;border-left:4px solid #C9A227;padding:14px 18px;border-radius:4px;margin:28px 0 20px">
+            <p style="margin:0;color:#7A6010;font-size:13px;line-height:1.6">
+              This link expires in <strong>1 hour</strong> and can only be used once.
+            </p>
+          </div>
+
+          <p style="color:#888;font-size:13px;line-height:1.6;margin:0 0 6px">
+            If the button doesn't work, paste this into your browser:
+          </p>
+          <p style="color:#C9A227;font-size:12px;word-break:break-all;margin:0">${resetLink}</p>
+
+          <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE">
+            <p style="color:#888;font-size:12px;line-height:1.6;margin:0">
+              <strong>Didn't request this?</strong> You can safely ignore this email —
+              your password will not change. If you're concerned, contact us at
+              <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>.
+            </p>
+            <p style="color:#aaa;font-size:11px;margin:16px 0 0;text-align:center">
+              LegalXOnline · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222
+            </p>
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendPasswordResetEmail failed:', err)
+  }
+}
+
 // ── Lawyer: documents submitted — admin notification with signed URLs ──────────
 export async function sendLawyerDocsSubmittedAdmin(opts: {
   name: string
