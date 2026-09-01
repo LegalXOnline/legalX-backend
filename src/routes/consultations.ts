@@ -4,6 +4,7 @@ import { RtcTokenBuilder, RtcRole } from 'agora-token'
 import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody } from '../lib/validation'
+import { createNotification } from '../lib/notify'
 import { z } from 'zod'
 
 const router = Router()
@@ -239,6 +240,14 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
 
     await supabase.from('consultations').update({ started_at: new Date().toISOString() }).eq('id', req.params.id)
 
+    await createNotification({
+      accountId: consultation.client_id,
+      title: 'Your lawyer has joined',
+      message: 'The consultation is starting now.',
+      type: 'consultation',
+      link: `/consultation/${req.params.id}`,
+    })
+
     res.json({
       consultationId: req.params.id,
       channelName,
@@ -248,6 +257,60 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
     })
   } catch (err) {
     console.error('[consultations/accept]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── GET /api/consultations/:id/agora-token ───────────────────────────────────
+// Issues a fresh RTC token for a session already in progress. This exists so
+// the call page can fetch its own credentials instead of receiving them in the
+// URL, where they would leak through history, Referer headers and server logs.
+//
+// The App Certificate never leaves the server; only the derived token is sent,
+// and only to the two accounts attached to this consultation.
+router.get('/:id/agora-token', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const consultationId = String(req.params.id)
+    const { data: consultation, error } = await supabase
+      .from('consultations')
+      .select('id, client_id, lawyer_id, status, type, hms_room_id')
+      .eq('id', consultationId)
+      .single()
+
+    if (error || !consultation) { res.status(404).json({ error: 'Consultation not found' }); return }
+
+    const isClient = consultation.client_id === user.id
+    const isLawyer = consultation.lawyer_id === user.id
+    if (!isClient && !isLawyer) {
+      res.status(403).json({ error: 'You are not a participant in this consultation' })
+      return
+    }
+
+    if (consultation.status === 'cancelled' || consultation.status === 'completed') {
+      res.status(400).json({ error: 'This consultation has ended.' })
+      return
+    }
+
+    // The lawyer is the host; the client joins as an audience-capable publisher.
+    const channelName = consultation.hms_room_id || consultation.id
+    const token = generateAgoraToken(channelName, user.id, isLawyer ? 'host' : 'client')
+
+    res.json({
+      consultationId,
+      channelName,
+      agoraAppId: process.env.AGORA_APP_ID!,
+      token,
+      uid: userIdToUid(user.id),
+      role: isLawyer ? 'lawyer' : 'client',
+      type: consultation.type,
+      status: consultation.status,
+      counterpartId: isLawyer ? consultation.client_id : consultation.lawyer_id,
+    })
+  } catch (err) {
+    console.error('[consultations/agora-token]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -283,6 +346,75 @@ router.patch('/:id/cancel', async (req: Request, res: Response) => {
     res.json({ message: 'Consultation cancelled', consultationId: req.params.id })
   } catch (err) {
     console.error('[consultations/cancel]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── POST /api/consultations/review ───────────────────────────────────────────
+// Post-call rating. Only a client who actually held a consultation with this
+// lawyer may review them, so ratings cannot be manufactured by outsiders.
+const reviewSchema = z.object({
+  targetId: z.string().uuid(),
+  rating: z.coerce.number().int().min(1).max(5),
+  comment: z.string().max(2000).trim().optional().default(''),
+  targetType: z.enum(['lawyer', 'consultation']).default('lawyer'),
+})
+
+router.post('/review', validateBody(reviewSchema), async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const { targetId, rating, comment, targetType } = req.body
+
+    // The lawyer being rated: either the target itself, or the lawyer on the
+    // consultation being rated.
+    let lawyerId = targetId
+    if (targetType === 'consultation') {
+      const { data: consult } = await supabase
+        .from('consultations').select('lawyer_id, client_id').eq('id', targetId).maybeSingle()
+      if (!consult) { res.status(404).json({ error: 'Consultation not found' }); return }
+      if (consult.client_id !== user.id) { res.status(403).json({ error: 'Not your consultation' }); return }
+      lawyerId = consult.lawyer_id
+    } else {
+      const { count } = await supabase
+        .from('consultations')
+        .select('id', { count: 'exact', head: true })
+        .eq('lawyer_id', targetId)
+        .eq('client_id', user.id)
+      if (!count) {
+        res.status(403).json({ error: 'You can only review a lawyer you have consulted.' })
+        return
+      }
+    }
+
+    const { error: insertErr } = await supabase.from('reviews').insert({
+      account_id: user.id,
+      target_type: targetType,
+      target_id: targetId,
+      rating,
+      comment: comment || null,
+    })
+    if (insertErr) throw insertErr
+
+    // Recompute the lawyer's rating from all their reviews rather than nudging
+    // a running average, so a bad write can't skew it permanently.
+    if (lawyerId) {
+      const { data: all } = await supabase
+        .from('reviews').select('rating').eq('target_type', 'lawyer').eq('target_id', lawyerId)
+      const ratings = (all ?? []).map(r => Number(r.rating)).filter(Number.isFinite)
+      if (ratings.length) {
+        const avg = ratings.reduce((a, b) => a + b, 0) / ratings.length
+        await supabase.from('lawyer_profiles').update({
+          avg_rating: +avg.toFixed(2),
+          total_reviews: ratings.length,
+        }).eq('account_id', lawyerId)
+      }
+    }
+
+    res.status(201).json({ message: 'Thanks for your feedback' })
+  } catch (err) {
+    console.error('[consultations/review]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })

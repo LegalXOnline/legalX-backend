@@ -24,6 +24,7 @@ import {
   uuidParamSchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
+import { createNotification } from '../lib/notify'
 
 const router = Router()
 
@@ -502,6 +503,14 @@ router.patch('/clients/:id/wallet', requireAdmin, validateParams(accountIdParamS
       after: { balance: next, amount, type, reason },
     })
 
+    await createNotification({
+      accountId: id,
+      title: type === 'credit' ? 'XCoins added' : 'XCoins deducted',
+      message: `₹${amount.toLocaleString('en-IN')} was ${type === 'credit' ? 'added to' : 'deducted from'} your wallet. Reason: ${reason}`,
+      type: 'wallet',
+      link: '/',
+    })
+
     return res.json({ balance: next, previousBalance: previous })
   } catch (err) {
     next(err)
@@ -580,6 +589,14 @@ router.patch('/lawyers/:id/approve', requireAdmin, validateParams(lawyerIdParamS
       after: { verification_status: 'verified' },
     })
 
+    await createNotification({
+      accountId: id,
+      title: 'Your profile is approved',
+      message: 'You are now live on LegalX and can start accepting consultations.',
+      type: 'verification',
+      link: '/lawyer-dashboard',
+    })
+
     res.json({ message: 'Lawyer approved successfully' })
   } catch (err) {
     next(err)
@@ -614,6 +631,16 @@ router.patch('/lawyers/:id/reject', requireAdmin, validateParams(lawyerIdParamSc
       action: 'REJECT_LAWYER', entityType: 'lawyer', entityId: id,
       before: { verification_status: 'pending_verification' },
       after: { verification_status: 'rejected', reason: reason ?? null },
+    })
+
+    await createNotification({
+      accountId: id,
+      title: 'Application needs attention',
+      message: reason
+        ? `We could not verify your credentials: ${reason}`
+        : 'We could not verify your credentials. Please review and resubmit.',
+      type: 'verification',
+      link: '/onboarding/lawyer',
     })
 
     res.json({ message: 'Lawyer application rejected' })
