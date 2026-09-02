@@ -22,6 +22,71 @@ const MIN_RELEVANCE = 3
 export const RAW_SOURCE_MAX_CHARS = 20_000
 
 /**
+ * Cheap pre-flight check, run BEFORE spending an LLM call.
+ *
+ * Regulator feeds are dominated by items that are a headline and nothing else —
+ * SEBI recovery certificates, release orders, auction results. The model
+ * correctly refused all of them, but only after a full request each, which is
+ * what exhausted the daily quota before any real content was reached.
+ *
+ * These are the same signals the model reported in its own refusals:
+ * "only a headline", "repetitive", "no substantive content".
+ */
+export function looksSubstantive(text: string, headline?: string): { ok: boolean; reason?: string } {
+  const clean = text.replace(/\s+/g, ' ').trim()
+
+  if (clean.length < 700) {
+    return { ok: false, reason: `Only ${clean.length} characters of body text — too thin to summarise.` }
+  }
+
+  // A page that is mostly its own headline repeated in nav, breadcrumb and
+  // title is a stub with no article behind it.
+  if (headline && headline.length > 25) {
+    const needle = headline.slice(0, 40).toLowerCase()
+    const hay = clean.toLowerCase()
+    let count = 0, from = 0
+    while (true) {
+      const at = hay.indexOf(needle, from)
+      if (at === -1) break
+      count++
+      from = at + needle.length
+    }
+    if (count >= 3 && clean.length < 2_500) {
+      return { ok: false, reason: 'Page repeats its headline with no article body.' }
+    }
+  }
+
+  // Real prose has sentences. A list of certificate numbers does not.
+  const sentences = clean.split(/[.!?]\s/).filter(p => p.trim().split(/\s+/).length >= 8)
+  if (sentences.length < 4) {
+    return { ok: false, reason: 'Fewer than four full sentences — likely a table or a stub.' }
+  }
+
+  return { ok: true }
+}
+
+/**
+ * Titles that are administrative records rather than legal developments.
+ * Matched before fetching, so these cost nothing at all.
+ */
+const NON_STORY_PATTERNS = [
+  /recovery certificate/i,
+  /release order/i,
+  /remittance order/i,
+  /certificate of completion/i,
+  /\bdefaulter\b/i,
+  /attachment of (bank|demat)/i,
+  /money market operations/i,
+  /auction (result|of state)/i,
+  /\bcut-?off price/i,
+  /appoints? (shri|smt|dr)/i,
+]
+
+function isNonStory(title: string): boolean {
+  return NON_STORY_PATTERNS.some(re => re.test(title))
+}
+
+/**
  * Pause between documents, sized to whichever provider is primary.
  */
 function pacingMs(): number {
@@ -35,6 +100,16 @@ function pacingMs(): number {
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+/**
+ * How long to wait when a per-minute quota is hit, and how many times.
+ *
+ * Per-minute limits refill in a minute, so pausing is nearly always better than
+ * abandoning the run. Capped so a genuinely exhausted daily quota cannot make
+ * the job hang indefinitely.
+ */
+const COOLDOWN_MS = Number(process.env.SHORTS_COOLDOWN_MS ?? 65_000)
+const MAX_COOLDOWNS = Number(process.env.SHORTS_MAX_COOLDOWNS ?? 3)
 
 /**
  * Live state of the background ingest.
@@ -58,11 +133,13 @@ export interface IngestJob {
   total: number
   report: IngestReport | null
   error: string | null
+  /** Set while waiting out a provider quota, so the UI can say why it paused. */
+  cooldownUntil: string | null
 }
 
 let currentJob: IngestJob = {
   status: 'idle', startedAt: null, finishedAt: null,
-  processed: 0, total: 0, report: null, error: null,
+  processed: 0, total: 0, report: null, error: null, cooldownUntil: null,
 }
 
 export function getIngestJob(): IngestJob {
@@ -87,6 +164,7 @@ export function startIngest(opts: { feeds?: string[]; target?: number } = {}): I
     total: 0,
     report: null,
     error: null,
+    cooldownUntil: null,
   }
 
   // Deliberately not awaited — the caller responds straight away.
@@ -95,6 +173,10 @@ export function startIngest(opts: { feeds?: string[]; target?: number } = {}): I
     onProgress: (processed, total) => {
       currentJob.processed = processed
       currentJob.total = total
+      currentJob.cooldownUntil = null
+    },
+    onCooldown: (_attempt, waitMs) => {
+      currentJob.cooldownUntil = new Date(Date.now() + waitMs).toISOString()
     },
   })
     .then(report => {
@@ -201,6 +283,7 @@ export async function runIngest(opts: {
   /** How many suggestions to aim for. The editor will keep roughly half. */
   target?: number
   onProgress?: (processed: number, total: number) => void
+  onCooldown?: (attempt: number, waitMs: number) => void
 } = {}): Promise<IngestReport> {
   const target = Math.min(Math.max(opts.target ?? 8, 1), 20)
 
@@ -225,12 +308,35 @@ export async function runIngest(opts: {
   }
 
   candidates = await dropAlreadySeen(candidates)
+
+  // Drop administrative notices by title before fetching anything. These are
+  // the bulk of a regulator feed and none of them is a legal development.
+  const beforeFilter = candidates.length
+  candidates = candidates.filter(item => {
+    if (!isNonStory(item.title)) return true
+    report.skipped.push({
+      title: item.title.slice(0, 90),
+      reason: 'Administrative notice — filtered before fetching.',
+    })
+    return false
+  })
+  if (beforeFilter !== candidates.length) {
+    logger.info({ filtered: beforeFilter - candidates.length }, 'ingest: administrative notices filtered')
+  }
   logger.info({ candidates: candidates.length, target }, 'ingest: candidates after dedupe')
   opts.onProgress?.(0, Math.min(candidates.length, target))
 
   let processed = 0
   let index = 0
-  for (const item of candidates) {
+  let cooldowns = 0
+  let retryItem: FeedItem | null = null
+
+  // A plain for-of cannot re-serve an item, and after a cooldown we want to
+  // retry the one that failed rather than skip it.
+  const queue = [...candidates]
+  while (queue.length > 0 || retryItem) {
+    const item: FeedItem = retryItem ?? queue.shift()!
+    retryItem = null
     index += 1
     if (report.proposed >= target) break
     opts.onProgress?.(report.proposed, target)
@@ -250,6 +356,14 @@ export async function runIngest(opts: {
       }
       if (sourceText.length < 250 && item.description) {
         sourceText = `${item.title}\n\n${item.description}`
+      }
+
+      // Second gate, now that we have the body: reject stubs without paying
+      // for an LLM call to tell us they are stubs.
+      const substance = looksSubstantive(sourceText, item.title)
+      if (!substance.ok) {
+        report.skipped.push({ title: item.title.slice(0, 90), reason: substance.reason! })
+        continue
       }
 
       const result = await summariseSource(sourceText, {
@@ -277,17 +391,36 @@ export async function runIngest(opts: {
       }
     } catch (err: any) {
       const message = err?.message ?? 'unknown error'
+
+      // A missing key will never fix itself — stop immediately.
+      if (/not configured/i.test(message)) {
+        report.failed.push({ url: item.link, error: message })
+        report.stoppedEarly = true
+        report.stopReason = 'Summarisation is not configured.'
+        report.remaining = candidates.length - index
+        break
+      }
+
+      // A rate limit DOES fix itself. Per-minute quotas refill in a minute, so
+      // wait it out and retry this same item rather than abandoning the run —
+      // that is the difference between four cards and twelve.
+      if (/rate limit|unavailable/i.test(message) && cooldowns < MAX_COOLDOWNS) {
+        cooldowns += 1
+        logger.warn(
+          { cooldown: cooldowns, waitMs: COOLDOWN_MS, remaining: candidates.length - index },
+          'ingest: quota reached, pausing before retry'
+        )
+        opts.onCooldown?.(cooldowns, COOLDOWN_MS)
+        await sleep(COOLDOWN_MS)
+        retryItem = item          // put it back at the front
+        continue
+      }
+
       report.failed.push({ url: item.link, error: message })
 
-      // A quota or configuration problem applies to every remaining candidate,
-      // so stop rather than failing the rest one by one. Whatever was already
-      // inserted stays — a partial batch is a useful batch, and the rest can be
-      // picked up on the next run.
-      if (/rate limit|not configured|unavailable/i.test(message)) {
+      if (/rate limit|unavailable/i.test(message)) {
         report.stoppedEarly = true
-        report.stopReason = /rate limit|unavailable/i.test(message)
-          ? 'Summarisation quota reached for now.'
-          : 'Summarisation is not configured.'
+        report.stopReason = `Summarisation quota reached, and it did not recover after ${MAX_COOLDOWNS} pauses.`
         report.remaining = candidates.length - index
         break
       }
