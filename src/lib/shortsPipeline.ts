@@ -36,6 +36,82 @@ function pacingMs(): number {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+/**
+ * Live state of the background ingest.
+ *
+ * A full run takes minutes — fetching each article and summarising it — which
+ * is far longer than the Vercel gateway will hold a request open. It returned
+ * 502 while the backend carried on working, so the admin saw a failure for a
+ * run that actually succeeded. The run now happens in the background and the
+ * UI polls this.
+ *
+ * In-memory because the API is a single Render instance. If it is ever scaled
+ * out this must move to the database, or each instance will report only its
+ * own runs.
+ */
+export interface IngestJob {
+  status: 'idle' | 'running' | 'done' | 'failed'
+  startedAt: string | null
+  finishedAt: string | null
+  /** Candidates processed so far, and how many there are in total. */
+  processed: number
+  total: number
+  report: IngestReport | null
+  error: string | null
+}
+
+let currentJob: IngestJob = {
+  status: 'idle', startedAt: null, finishedAt: null,
+  processed: 0, total: 0, report: null, error: null,
+}
+
+export function getIngestJob(): IngestJob {
+  return currentJob
+}
+
+/**
+ * Starts a run in the background if one is not already going.
+ *
+ * Returns immediately. Refusing to start a second concurrent run matters:
+ * two runs would race on the same feed items and burn double the quota
+ * producing duplicates the unique index then rejects.
+ */
+export function startIngest(opts: { feeds?: string[]; target?: number } = {}): IngestJob {
+  if (currentJob.status === 'running') return currentJob
+
+  currentJob = {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    processed: 0,
+    total: 0,
+    report: null,
+    error: null,
+  }
+
+  // Deliberately not awaited — the caller responds straight away.
+  void runIngest({
+    ...opts,
+    onProgress: (processed, total) => {
+      currentJob.processed = processed
+      currentJob.total = total
+    },
+  })
+    .then(report => {
+      currentJob = { ...currentJob, status: 'done', finishedAt: new Date().toISOString(), report }
+    })
+    .catch(err => {
+      currentJob = {
+        ...currentJob,
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        error: err?.message ?? 'Ingest failed',
+      }
+    })
+
+  return currentJob
+}
+
 export interface IngestReport {
   proposed: number
   skipped: { title: string; reason: string }[]
@@ -124,6 +200,7 @@ export async function runIngest(opts: {
   feeds?: string[]
   /** How many suggestions to aim for. The editor will keep roughly half. */
   target?: number
+  onProgress?: (processed: number, total: number) => void
 } = {}): Promise<IngestReport> {
   const target = Math.min(Math.max(opts.target ?? 8, 1), 20)
 
@@ -149,12 +226,14 @@ export async function runIngest(opts: {
 
   candidates = await dropAlreadySeen(candidates)
   logger.info({ candidates: candidates.length, target }, 'ingest: candidates after dedupe')
+  opts.onProgress?.(0, Math.min(candidates.length, target))
 
   let processed = 0
   let index = 0
   for (const item of candidates) {
     index += 1
     if (report.proposed >= target) break
+    opts.onProgress?.(report.proposed, target)
 
     // Pace from the second document onward; the first costs nothing to start.
     if (processed > 0) await sleep(pacingMs())

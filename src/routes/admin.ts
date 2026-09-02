@@ -29,7 +29,7 @@ import {
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
-import { runIngest, draftFromSource } from '../lib/shortsPipeline'
+import { startIngest, getIngestJob, draftFromSource } from '../lib/shortsPipeline'
 import { FEED_SOURCES } from '../lib/sources/rss'
 
 const router = Router()
@@ -1306,24 +1306,38 @@ router.post('/shorts/ingest', requireAdmin, validateBody(shortsIngestSchema), as
 })
 
 // ── POST /api/admin/shorts/auto-ingest ───────────────────────────────────────
-// Manual "run now". Proposes a batch of suggestions for review; the scheduled
-// job hits the same pipeline via /api/jobs/shorts-daily.
+// Starts a run and returns immediately.
+//
+// A full batch takes minutes, which is far longer than the Vercel gateway will
+// hold a request open — it returned 502 while the backend carried on working,
+// so a successful run looked like a failure. The client now polls
+// /shorts/ingest-status instead.
 router.post('/shorts/auto-ingest', requireAdmin, validateBody(shortsAutoIngestSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const report = await runIngest({ target: req.body.limit, feeds: req.body.feeds })
+    const existing = getIngestJob()
+    if (existing.status === 'running') {
+      return res.status(202).json({ ...existing, alreadyRunning: true })
+    }
+
+    const job = startIngest({ target: req.body.limit, feeds: req.body.feeds })
 
     await writeAudit(req, {
       action: 'INGEST_SHORTS', entityType: 'short', entityId: null,
-      after: { proposed: report.proposed, skipped: report.skipped.length, failed: report.failed.length },
+      after: { target: req.body.limit, startedAt: job.startedAt },
     })
 
-    return res.json(report)
+    return res.status(202).json(job)
   } catch (err: any) {
-    if (/not configured|rate limit|No feed sources/i.test(err?.message ?? '')) {
+    if (/not configured|No feed sources/i.test(err?.message ?? '')) {
       return res.status(422).json({ error: err.message })
     }
     next(err)
   }
+})
+
+// ── GET /api/admin/shorts/ingest-status ──────────────────────────────────────
+router.get('/shorts/ingest-status', requireAdmin, (_req: Request, res: Response) => {
+  res.json(getIngestJob())
 })
 
 // ── GET /api/admin/shorts/feeds ──────────────────────────────────────────────
