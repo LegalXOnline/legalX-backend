@@ -11,6 +11,18 @@ import { FEED_SOURCES, fetchFeed, fetchArticleText, type FeedItem } from './sour
  */
 const MIN_RELEVANCE = 3
 
+/**
+ * Pause between documents.
+ *
+ * The Groq free tier allows 8,000 tokens per minute and a trimmed document runs
+ * 2,000–4,000, so roughly two per minute is the ceiling. Without this the run
+ * burns its allowance in the first few seconds and every remaining candidate
+ * fails on a 429.
+ */
+const PACE_MS = Number(process.env.SHORTS_PACE_MS ?? 22_000)
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
 export interface IngestReport {
   proposed: number
   skipped: { title: string; reason: string }[]
@@ -119,8 +131,13 @@ export async function runIngest(opts: {
   candidates = await dropAlreadySeen(candidates)
   logger.info({ candidates: candidates.length, target }, 'ingest: candidates after dedupe')
 
+  let processed = 0
   for (const item of candidates) {
     if (report.proposed >= target) break
+
+    // Pace from the second document onward; the first costs nothing to start.
+    if (processed > 0) await sleep(PACE_MS)
+    processed += 1
 
     try {
       // The feed description is usually a stub; the article body is what the
@@ -192,8 +209,12 @@ export async function draftFromSource(input: {
     throw new Error(`Already ingested as "${existing.title}".`)
   }
 
-  const sourceText = input.rawText?.trim()
-    ? input.rawText
+  // Pasted text wins, but only if it is actually a document. A short string is
+  // almost always a note or a search phrase typed into the wrong box, so fall
+  // back to fetching the URL rather than failing on it.
+  const pasted = input.rawText?.trim() ?? ''
+  const sourceText = pasted.length >= 250
+    ? pasted
     : await fetchArticleText(input.sourceUrl)
 
   const result = await summariseSource(sourceText, { sourceName: input.sourceName })
