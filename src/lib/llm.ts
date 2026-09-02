@@ -671,6 +671,118 @@ export async function summariseSource(
   return parseSuggestion(content, text)
 }
 
+// ── Stage 3: verifier ─────────────────────────────────────────────────────────
+const VERIFIER_PROMPT = `You are checking a generated card against its source text. You are not
+improving the card. You are finding what it claims that the source does not
+support.
+
+You will receive SOURCE TEXT and CARD JSON.
+
+For every factual statement in the card — every number, date, threshold,
+section number, name, and every cause-and-effect claim — locate the exact
+sentence in the source that supports it.
+
+Flag a claim as unsupported when it is:
+- absent from the source
+- stated more strongly than the source states it ("must" where the source
+  says "may"; "all" where the source says "certain")
+- a consequence the source does not draw
+- a citation, date, or figure the source does not contain
+
+Do not flag: plain-language rewording that preserves meaning, or ordinary
+summarisation that drops detail without changing it.
+
+Return JSON only:
+{
+  "verified": true | false,
+  "unsupported": [
+    {"claim": "<quote from card>", "problem": "<why>",
+     "severity": "high|medium|low"}
+  ],
+  "citation_ok": true | false,
+  "confidence": 0.0
+}
+
+verified is false if any unsupported item has severity "high", or if
+citation_ok is false.`
+
+export interface VerdictIssue {
+  claim: string
+  problem: string
+  severity: 'high' | 'medium' | 'low'
+}
+
+export interface VerifyResult {
+  verified: boolean
+  unsupported: VerdictIssue[]
+  citationOk: boolean
+  confidence: number
+}
+
+/**
+ * Independent check of a generated card against its source.
+ *
+ * A separate call on purpose: the generator has already committed to its
+ * output, and asking it to mark its own work invites agreement. This is the
+ * cheapest insurance a legal product has — one extra model call against the
+ * cost of publishing a fabricated holding.
+ *
+ * Failing open would defeat the point, so an unreadable verdict counts as
+ * unverified.
+ */
+export async function verifyCard(
+  card: Suggestion,
+  sourceText: string
+): Promise<VerifyResult> {
+  const { text } = trimSource(sourceText)
+
+  const payload = {
+    headline: card.title,
+    summary: card.summary,
+    what_it_means: card.takeaway,
+    key_points: card.keyPoints,
+    statute_reference: card.statuteReference,
+    deadline: card.deadline,
+  }
+
+  try {
+    const raw = await callLlm(
+      `SOURCE TEXT:\n${text}\n\n---\n\nCARD JSON:\n${JSON.stringify(payload, null, 2)}`,
+      VERIFIER_PROMPT,
+      { maxTokens: 1200 }
+    )
+    const parsed = JSON.parse(extractJson(raw))
+
+    const unsupported: VerdictIssue[] = Array.isArray(parsed.unsupported)
+      ? parsed.unsupported.map((u: any) => ({
+          claim: String(u.claim ?? '').slice(0, 300),
+          problem: String(u.problem ?? '').slice(0, 300),
+          severity: ['high', 'medium', 'low'].includes(u.severity) ? u.severity : 'medium',
+        }))
+      : []
+
+    const citationOk = parsed.citation_ok !== false
+    const hasHigh = unsupported.some(u => u.severity === 'high')
+
+    return {
+      // Recomputed rather than trusted: the contract says a high-severity
+      // finding means unverified, so enforce it here.
+      verified: parsed.verified === true && !hasHigh && citationOk,
+      unsupported,
+      citationOk,
+      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0,
+    }
+  } catch (err: any) {
+    logger.warn({ err: err?.message }, 'verifier failed — treating card as unverified')
+    return {
+      verified: false,
+      unsupported: [{ claim: '(verifier unavailable)', problem: String(err?.message ?? 'unknown'), severity: 'medium' }],
+      citationOk: false,
+      confidence: 0,
+    }
+  }
+}
+
 /** URL-safe slug, with a short suffix so two similar titles cannot collide. */
 export function slugify(title: string, suffix: string): string {
   const base = title

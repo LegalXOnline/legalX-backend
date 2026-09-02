@@ -97,3 +97,10 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_shorts_tier
   ON shorts_cards(relevance_tier, published_at DESC) WHERE is_published = true;
+
+-- ── Stage 3 verifier output ───────────────────────────────────────────────────
+-- An independent pass over each generated card. Stored so a reviewer can see
+-- what was questioned, not just whether it passed.
+ALTER TABLE shorts_cards ADD COLUMN IF NOT EXISTS verified BOOLEAN;
+ALTER TABLE shorts_cards ADD COLUMN IF NOT EXISTS verifier_notes TEXT;
+ALTER TABLE shorts_cards ADD COLUMN IF NOT EXISTS confidence_score NUMERIC(3,2);
