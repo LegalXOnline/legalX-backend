@@ -15,6 +15,14 @@ import { rateLimit } from 'express-rate-limit'
 
 const router = Router()
 
+/**
+ * How long the browser keeps the session cookies, independent of how long the
+ * tokens inside them are valid. Matches the refresh token's 30-day life so the
+ * client always has something to present, and a stale access token can be
+ * exchanged rather than looking like a signed-out user.
+ */
+const SESSION_COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+
 // Password-recovery endpoints send email and mutate credentials — much tighter
 // than the global 100/15min so a stolen inbox can't be brute-forced or spammed.
 const passwordResetLimiter = rateLimit({
@@ -145,11 +153,18 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
     const user = data.user
 
     // Set HttpOnly cookies — JS on the browser CANNOT read these
+    // The cookie deliberately outlives the token inside it.
+    //
+    // Tying maxAge to expires_in (1 hour) made the browser delete the cookie at
+    // the moment the token expired, so the next request arrived with NO
+    // credentials at all — indistinguishable from a signed-out user, and the
+    // refresh cookie never got a chance to be spent. Expiry is enforced by
+    // validating the JWT server-side, not by how long the browser keeps it.
     res.cookie('lx_access_token', access_token, {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge: expires_in * 1000,
+      maxAge: SESSION_COOKIE_MAX_AGE_MS,
       path: '/',
     })
 
@@ -157,7 +172,7 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      maxAge: SESSION_COOKIE_MAX_AGE_MS,
       path: '/',
     })
 
@@ -225,11 +240,18 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
     const { access_token, refresh_token, expires_in } = data.session
 
+    // The cookie deliberately outlives the token inside it.
+    //
+    // Tying maxAge to expires_in (1 hour) made the browser delete the cookie at
+    // the moment the token expired, so the next request arrived with NO
+    // credentials at all — indistinguishable from a signed-out user, and the
+    // refresh cookie never got a chance to be spent. Expiry is enforced by
+    // validating the JWT server-side, not by how long the browser keeps it.
     res.cookie('lx_access_token', access_token, {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge: expires_in * 1000,
+      maxAge: SESSION_COOKIE_MAX_AGE_MS,
       path: '/',
     })
     // Supabase rotates refresh tokens, so the new one must replace the old.
@@ -237,7 +259,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
       httpOnly: true,
       secure: isProduction,
       sameSite: isProduction ? 'none' : 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000,
+      maxAge: SESSION_COOKIE_MAX_AGE_MS,
       path: '/',
     })
 

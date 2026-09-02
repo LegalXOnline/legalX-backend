@@ -1,4 +1,5 @@
 import { logger } from './logger'
+import { sendProviderFailureAlert } from './email'
 
 /**
  * Summarisation for the Knowledge Center.
@@ -9,31 +10,50 @@ import { logger } from './logger'
  * free tier, no card.
  */
 
-export type LlmProvider = 'groq' | 'openrouter'
+export type LlmProvider = 'gemini' | 'groq' | 'openrouter'
 
 interface ProviderConfig {
-  url: string
+  name: LlmProvider
   model: string
   apiKey: string | undefined
 }
 
-function providerConfig(): ProviderConfig {
-  const provider = (process.env.SHORTS_LLM_PROVIDER ?? 'groq') as LlmProvider
+function configFor(provider: LlmProvider): ProviderConfig {
   switch (provider) {
+    case 'gemini':
+      return {
+        name: 'gemini',
+        model: process.env.SHORTS_GEMINI_MODEL ?? 'gemini-2.5-flash',
+        apiKey: process.env.GEMINI_API_KEY,
+      }
     case 'openrouter':
       return {
-        url: 'https://openrouter.ai/api/v1/chat/completions',
+        name: 'openrouter',
         model: process.env.SHORTS_LLM_MODEL ?? 'openai/gpt-oss-120b:free',
         apiKey: process.env.OPENROUTER_API_KEY,
       }
     case 'groq':
     default:
       return {
-        url: 'https://api.groq.com/openai/v1/chat/completions',
+        name: 'groq',
         model: process.env.SHORTS_LLM_MODEL ?? 'openai/gpt-oss-120b',
         apiKey: process.env.GROQ_API_KEY,
       }
   }
+}
+
+/**
+ * Provider order: the configured primary, then the fallback.
+ *
+ * Gemini leads because its free tier allows 1,000,000 tokens per minute against
+ * Groq's 8,000 — the difference between summarising a long judgment in one call
+ * and not being able to at all. Groq backs it up so an expired Gemini key
+ * degrades the pipeline instead of stopping it.
+ */
+function providerChain(): LlmProvider[] {
+  const primary = (process.env.SHORTS_LLM_PROVIDER ?? 'gemini') as LlmProvider
+  const fallback = (process.env.SHORTS_LLM_FALLBACK ?? 'groq') as LlmProvider
+  return primary === fallback ? [primary] : [primary, fallback]
 }
 
 // Groq's free tier allows 8,000 tokens per minute. Long source documents must
@@ -88,6 +108,40 @@ export interface SkippedSuggestion {
 }
 
 /**
+ * Statute explainers.
+ *
+ * Same grounding contract as everything else: the section text is supplied by
+ * the caller and the model may only restate it. It must NOT recall the Act from
+ * training data — a wrong section number or penalty published under a law
+ * firm's name is exactly the failure this whole design exists to prevent.
+ */
+const STATUTE_PROMPT = `You explain sections of Indian statutes to ordinary citizens on a legal-services platform.
+
+ABSOLUTE RULES — these override everything else:
+1. Use ONLY the section text supplied by the user. Never recall the Act from memory, however familiar it looks.
+2. Never state a penalty, time limit, threshold or cross-reference that is not written in the supplied text.
+3. If the supplied text is a heading, a fragment, or too thin to explain accurately, respond with {"skip": true, "reason": "..."} and nothing else.
+4. Never give legal advice or tell the reader what to do in their situation. Explain what the section says.
+5. If unsure, skip. A skipped section costs nothing; a wrong one is a liability.
+
+The "evidence" field must be an EXACT substring copied character-for-character from the supplied section text. Do not paraphrase or tidy it.
+
+Write for a reader with no legal training. Explain what the section does, when it applies, and what it requires or forbids.
+
+Respond with ONLY a JSON object, no markdown fence:
+{
+  "title": "under 90 characters, plain-English statement of what the section does",
+  "summary": "150-200 words explaining the section in short paragraphs",
+  "takeaway": "1-2 sentences on when this matters to an ordinary person",
+  "category": "one of: ${CATEGORIES.join(', ')}",
+  "court": null,
+  "tags": ["3-5 lowercase topic keywords"],
+  "evidence": "text copied EXACTLY from the supplied section",
+  "relevanceScore": 1-5,
+  "confidence": "high | medium | low"
+}`
+
+/**
  * The grounding contract.
  *
  * Hallucination in a legal feed is not a cosmetic problem — a fabricated
@@ -115,10 +169,12 @@ You must quote the source. The "evidence" field must be an EXACT substring copie
 
 Write for a reader with no legal training. Plain English, short sentences, no Latin unless the source turns on the term and you gloss it.
 
+The summary must be 150-200 words. If the source does not contain enough substance to support 150 words without padding or repetition, skip the item rather than stretching it.
+
 Respond with ONLY a JSON object, no markdown fence:
 {
   "title": "under 90 characters, states what happened, not the case name",
-  "summary": "50-70 words: what the issue was and what was decided or announced",
+  "summary": "150-200 words: the background, what was decided or announced, the reasoning, and who it affects. Write in short paragraphs, not one block.",
   "takeaway": "1-2 sentences on the practical effect for an ordinary person",
   "category": "one of: ${CATEGORIES.join(', ')}",
   "court": "the deciding court or issuing body, or null",
@@ -178,30 +234,79 @@ export function verifyEvidence(evidence: string, sourceText: string): boolean {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-async function callLlm(userContent: string, attempt = 0): Promise<string> {
-  const { url, model, apiKey } = providerConfig()
-  if (!apiKey) {
-    throw new Error('Summarisation is not configured — set GROQ_API_KEY (or OPENROUTER_API_KEY).')
+/** Marks failures that should trigger a fallback and an ops alert. */
+class ProviderUnavailable extends Error {
+  constructor(public provider: string, message: string) {
+    super(message)
   }
+}
+
+// ── Gemini ────────────────────────────────────────────────────────────────────
+async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt: string): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.model}:generateContent`
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': cfg.apiKey! },
     body: JSON.stringify({
-      model,
-      // Low temperature: this is extraction, not composition. Creativity here
-      // means inventing holdings that were never in the source.
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userContent }] }],
+      generationConfig: {
+        temperature: 0.15,
+        maxOutputTokens: 2000,
+        // Gemini can enforce the shape server-side, which removes the whole
+        // class of "model wrapped the JSON in prose" failures.
+        responseMimeType: 'application/json',
+      },
+    }),
+    signal: AbortSignal.timeout(90_000),
+  })
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    // 401/403 = bad or revoked key, 429 = quota exhausted. All mean "use the
+    // fallback and tell someone", as distinct from a transient 5xx.
+    if ([401, 403, 429].includes(res.status)) {
+      throw new ProviderUnavailable('Gemini', `HTTP ${res.status}: ${body.slice(0, 200)}`)
+    }
+    logger.error({ status: res.status, body: body.slice(0, 300) }, 'Gemini request failed')
+    throw new Error(`Summarisation failed (${res.status}).`)
+  }
+
+  const payload: any = await res.json()
+  const candidate = payload?.candidates?.[0]
+  if (candidate?.finishReason === 'MAX_TOKENS') {
+    throw new Error('Summarisation was cut off before completing. Try again.')
+  }
+  const content = candidate?.content?.parts?.map((p: any) => p.text).join('') ?? ''
+  if (!content) throw new ProviderUnavailable('Gemini', 'Empty response')
+  return content
+}
+
+// ── OpenAI-compatible (Groq, OpenRouter) ──────────────────────────────────────
+async function callOpenAiCompatible(
+  cfg: ProviderConfig,
+  userContent: string,
+  systemPrompt: string,
+  attempt = 0
+): Promise<string> {
+  const url = cfg.name === 'openrouter'
+    ? 'https://openrouter.ai/api/v1/chat/completions'
+    : 'https://api.groq.com/openai/v1/chat/completions'
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${cfg.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: cfg.model,
       temperature: 0.15,
       // gpt-oss is a reasoning model: its chain of thought is billed against
-      // this budget before a single character of JSON is emitted. At 1100 the
-      // reasoning consumed the allowance and responses arrived truncated
-      // mid-string, which surfaced as "malformed output".
+      // this budget before a single character of JSON is emitted. Too low and
+      // responses arrive truncated mid-string.
       max_tokens: 3000,
-      // Cuts reasoning length sharply. This task is extraction against a
-      // supplied text, not a problem that rewards deliberation.
       reasoning_effort: 'low',
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent },
       ],
     }),
@@ -211,16 +316,18 @@ async function callLlm(userContent: string, attempt = 0): Promise<string> {
   if (res.status === 429) {
     const body = await res.text().catch(() => '')
     // Groq states the exact wait in the error body; honour it rather than
-    // guessing. One retry only — a second 429 means the minute is genuinely
-    // exhausted and the caller should stop.
+    // guessing. One retry only.
     const waitSeconds = Number(body.match(/try again in ([\d.]+)s/)?.[1] ?? 0)
     if (attempt === 0 && waitSeconds > 0 && waitSeconds < 30) {
       logger.info({ waitSeconds }, 'LLM rate limited — waiting and retrying once')
       await sleep(Math.ceil(waitSeconds * 1000) + 500)
-      return callLlm(userContent, attempt + 1)
+      return callOpenAiCompatible(cfg, userContent, systemPrompt, attempt + 1)
     }
-    logger.error({ body: body.slice(0, 200) }, 'LLM rate limit exhausted')
-    throw new Error('Summarisation rate limit reached. Wait a minute and try again.')
+    throw new ProviderUnavailable(cfg.name, 'Rate limit exhausted')
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    throw new ProviderUnavailable(cfg.name, `HTTP ${res.status} — key rejected`)
   }
 
   if (!res.ok) {
@@ -233,14 +340,65 @@ async function callLlm(userContent: string, attempt = 0): Promise<string> {
   const choice = payload?.choices?.[0]
   const content = choice?.message?.content
 
-  // A truncated response is not malformed input — say which it is, so the fix
-  // is obvious from the logs.
   if (choice?.finish_reason === 'length') {
-    logger.warn({ model }, 'LLM response hit the token cap and was truncated')
+    logger.warn({ model: cfg.model }, 'LLM response hit the token cap and was truncated')
     throw new Error('Summarisation was cut off before completing. Try again.')
   }
   if (!content) throw new Error('Summarisation returned an empty response.')
   return content
+}
+
+/**
+ * Runs the request against the primary provider, falling back on the secondary
+ * if the primary is unavailable.
+ *
+ * "Unavailable" means a rejected key or an exhausted quota — conditions that
+ * will not fix themselves within the run. A transient 5xx is not retried on the
+ * fallback, because it says nothing about the primary's health.
+ */
+async function callLlm(userContent: string, systemPrompt = SYSTEM_PROMPT): Promise<string> {
+  const chain = providerChain()
+  const configured = chain.map(configFor).filter(c => c.apiKey)
+
+  if (configured.length === 0) {
+    throw new Error(
+      'Summarisation is not configured — set GEMINI_API_KEY (or GROQ_API_KEY).'
+    )
+  }
+
+  let lastError: Error | null = null
+
+  for (let i = 0; i < configured.length; i++) {
+    const cfg = configured[i]
+    try {
+      const content = cfg.name === 'gemini'
+        ? await callGemini(cfg, userContent, systemPrompt)
+        : await callOpenAiCompatible(cfg, userContent, systemPrompt)
+      if (i > 0) {
+        logger.warn({ provider: cfg.name }, 'summarised via fallback provider')
+      }
+      return content
+    } catch (err: any) {
+      lastError = err
+      if (!(err instanceof ProviderUnavailable)) throw err
+
+      const next = configured[i + 1]
+      logger.error(
+        { provider: cfg.name, reason: err.message, fallback: next?.name ?? null },
+        'summarisation provider unavailable'
+      )
+      // Fire-and-forget: an ops email must not delay or fail the ingest run.
+      sendProviderFailureAlert({
+        provider: cfg.name,
+        reason: err.message,
+        fallbackProvider: next?.name ?? null,
+      }).catch(() => {})
+    }
+  }
+
+  throw new Error(
+    `All summarisation providers are unavailable. Last error: ${lastError?.message ?? 'unknown'}`
+  )
 }
 
 /**
@@ -250,23 +408,8 @@ async function callLlm(userContent: string, attempt = 0): Promise<string> {
  * evidence check. Callers treat that as a normal outcome, not an error — the
  * pipeline is expected to reject a good share of its candidates.
  */
-export async function summariseSource(
-  sourceText: string,
-  context?: { title?: string; sourceName?: string }
-): Promise<Suggestion | SkippedSuggestion> {
-  const { text, trimmed } = trimSource(sourceText)
-  if (text.length < 250) {
-    return { skipped: true, reason: 'Source text too short to summarise reliably.' }
-  }
-
-  const header = [
-    context?.title ? `HEADLINE: ${context.title}` : null,
-    context?.sourceName ? `SOURCE: ${context.sourceName}` : null,
-    trimmed ? 'NOTE: this document was truncated for length.' : null,
-  ].filter(Boolean).join('\n')
-
-  const content = await callLlm(`${header}\n\n---\n\n${text}`)
-
+/** Parses and validates a model response against the source it was drawn from. */
+function parseSuggestion(content: string, sourceForEvidence: string): Suggestion | SkippedSuggestion {
   let parsed: any
   try {
     parsed = JSON.parse(extractJson(content))
@@ -287,9 +430,7 @@ export async function summariseSource(
     return { skipped: true, reason: 'Model produced no title or summary.' }
   }
 
-  // The load-bearing check. A quote that is not in the source means the
-  // summary was not drawn from it.
-  if (!verifyEvidence(evidence, text)) {
+  if (!verifyEvidence(evidence, sourceForEvidence)) {
     logger.warn({ title, evidence: evidence.slice(0, 120) }, 'evidence not found in source — discarding suggestion')
     return {
       skipped: true,
@@ -313,6 +454,52 @@ export async function summariseSource(
     relevanceScore: Number.isFinite(relevance) ? Math.min(5, Math.max(1, Math.round(relevance))) : 3,
     confidence,
   }
+}
+
+/** Explains one statutory section, grounded strictly in the supplied text. */
+export async function explainStatuteSection(input: {
+  actName: string
+  sectionNumber: string
+  sectionHeading?: string
+  sectionText: string
+}): Promise<Suggestion | SkippedSuggestion> {
+  const { text } = trimSource(input.sectionText)
+  if (text.length < 200) {
+    return { skipped: true, reason: 'Section text too short to explain reliably.' }
+  }
+
+  const content = await callLlm(
+    `ACT: ${input.actName}
+SECTION: ${input.sectionNumber}` +
+    (input.sectionHeading ? `
+HEADING: ${input.sectionHeading}` : '') +
+    `
+
+---
+
+${text}`,
+    STATUTE_PROMPT
+  )
+  return parseSuggestion(content, text)
+}
+
+export async function summariseSource(
+  sourceText: string,
+  context?: { title?: string; sourceName?: string }
+): Promise<Suggestion | SkippedSuggestion> {
+  const { text, trimmed } = trimSource(sourceText)
+  if (text.length < 250) {
+    return { skipped: true, reason: 'Source text too short to summarise reliably.' }
+  }
+
+  const header = [
+    context?.title ? `HEADLINE: ${context.title}` : null,
+    context?.sourceName ? `SOURCE: ${context.sourceName}` : null,
+    trimmed ? 'NOTE: this document was truncated for length.' : null,
+  ].filter(Boolean).join('\n')
+
+  const content = await callLlm(`${header}\n\n---\n\n${text}`)
+  return parseSuggestion(content, text)
 }
 
 /** URL-safe slug, with a short suffix so two similar titles cannot collide. */
