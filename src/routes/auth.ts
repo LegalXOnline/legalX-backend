@@ -194,6 +194,79 @@ router.post('/login', validateBody(authLoginSchema), async (req: Request, res: R
   }
 })
 
+// ── POST /api/auth/refresh ────────────────────────────────────────────────────
+// Exchanges the long-lived refresh cookie for a fresh access token.
+//
+// Supabase access tokens expire after an hour. Without this the refresh cookie
+// was set at login, cleared at logout, and never used in between — so every
+// user was silently signed out after 60 minutes and saw "Invalid or expired
+// session" with no way back except logging in again.
+router.post('/refresh', async (req: Request, res: Response) => {
+  try {
+    const refreshToken = req.cookies?.lx_refresh_token
+    if (!refreshToken) {
+      res.status(401).json({ error: 'No refresh token' })
+      return
+    }
+
+    // The dedicated sign-in client, never the primary one — refreshSession
+    // caches a session on whichever client makes the call, and on the primary
+    // that would rebind every later DB query to this user.
+    const { data, error } = await supabaseSignIn.auth.refreshSession({ refresh_token: refreshToken })
+
+    if (error || !data.session) {
+      // The refresh token is spent or revoked. Clear both cookies so the
+      // browser stops presenting credentials that can never work.
+      res.clearCookie('lx_access_token', { httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', path: '/' })
+      res.clearCookie('lx_refresh_token', { httpOnly: true, secure: isProduction, sameSite: isProduction ? 'none' : 'lax', path: '/' })
+      res.status(401).json({ error: 'Session expired. Please sign in again.' })
+      return
+    }
+
+    const { access_token, refresh_token, expires_in } = data.session
+
+    res.cookie('lx_access_token', access_token, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
+      maxAge: expires_in * 1000,
+      path: '/',
+    })
+    // Supabase rotates refresh tokens, so the new one must replace the old.
+    res.cookie('lx_refresh_token', refresh_token, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? 'none' : 'lax',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+      path: '/',
+    })
+
+    const { data: account } = await supabase
+      .from('accounts')
+      .select('role, first_name, last_name, status')
+      .eq('id', data.user!.id)
+      .single()
+
+    if (!account || account.status === 'suspended') {
+      res.status(403).json({ error: 'Account unavailable' })
+      return
+    }
+
+    res.json({
+      user: {
+        id: data.user!.id,
+        email: data.user!.email,
+        firstName: account.first_name ?? '',
+        lastName: account.last_name ?? '',
+        role: account.role,
+      },
+    })
+  } catch (err) {
+    logger.error({ reqId: req.id, err }, 'token refresh failed')
+    res.status(401).json({ error: 'Could not refresh the session.' })
+  }
+})
+
 // ── POST /api/auth/logout ─────────────────────────────────────────────────────
 // Signs out from Supabase server-side (invalidates JWT) AND clears cookies.
 router.post('/logout', async (req: Request, res: Response) => {
