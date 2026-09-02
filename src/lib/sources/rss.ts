@@ -21,6 +21,10 @@ export interface FeedSource {
   enabled: boolean
   /** Why this source is lawful to summarise — kept next to the URL on purpose. */
   licenceNote: string
+  /** `rss` (default) parses XML; `federal_register` reads that API's JSON. */
+  kind?: 'rss' | 'federal_register'
+  /** Where the source sits, so the feed can be labelled for readers. */
+  jurisdiction?: 'IN' | 'US' | 'UK' | 'EU'
 }
 
 export const FEED_SOURCES: FeedSource[] = [
@@ -39,6 +43,27 @@ export const FEED_SOURCES: FeedSource[] = [
     sourceName: 'Securities and Exchange Board of India',
     enabled: true,
     licenceNote: 'Regulator press releases, published for public dissemination.',
+  },
+  {
+    id: 'federal_register',
+    label: 'US Federal Register — rules & notices',
+    // Filtered to rules and proposed rules: presidential proclamations carry no
+    // abstract and are rarely relevant to an Indian reader.
+    url: 'https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest&conditions%5Btype%5D%5B%5D=RULE&conditions%5Btype%5D%5B%5D=PRORULE&fields%5B%5D=title&fields%5B%5D=abstract&fields%5B%5D=html_url&fields%5B%5D=publication_date',
+    sourceName: 'US Federal Register',
+    enabled: true,
+    kind: 'federal_register',
+    jurisdiction: 'US',
+    licenceNote: 'US Government work — public domain, no copyright (17 U.S.C. §105).',
+  },
+  {
+    id: 'gov_uk',
+    label: 'UK Government — news & announcements',
+    url: 'https://www.gov.uk/search/news-and-communications.atom',
+    sourceName: 'UK Government',
+    enabled: true,
+    jurisdiction: 'UK',
+    licenceNote: 'Open Government Licence v3.0 — reuse permitted with attribution.',
   },
   {
     // Disabled: PIB returns 403 to any non-browser User-Agent. It publishes no
@@ -112,7 +137,36 @@ function decodeEntities(s: string): string {
     .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
 }
 
+/** The Federal Register speaks JSON, not RSS. */
+async function fetchFederalRegister(source: FeedSource): Promise<FeedItem[]> {
+  const res = await fetch(source.url, {
+    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!res.ok) {
+    logger.warn({ feed: source.id, status: res.status }, 'feed fetch failed')
+    return []
+  }
+  const json: any = await res.json()
+  return (json.results ?? [])
+    .filter((r: any) => r.title && r.html_url)
+    .map((r: any) => ({
+      title: String(r.title),
+      link: String(r.html_url),
+      description: r.abstract ? String(r.abstract) : undefined,
+      pubDate: r.publication_date ? String(r.publication_date) : undefined,
+      sourceName: source.sourceName,
+      sourceFeed: source.id,
+    }))
+}
+
 export async function fetchFeed(source: FeedSource): Promise<FeedItem[]> {
+  if (source.kind === 'federal_register') {
+    const items = await fetchFederalRegister(source)
+    logger.info({ feed: source.id, items: items.length }, 'feed fetched')
+    return items
+  }
+
   const res = await fetch(source.url, {
     headers: { 'User-Agent': USER_AGENT },
     signal: AbortSignal.timeout(30_000),
