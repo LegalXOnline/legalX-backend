@@ -15,6 +15,7 @@ import crypto from 'crypto'
 import { supabase } from '../src/lib/supabase'
 import { explainStatuteSection, slugify } from '../src/lib/llm'
 import { splitSections, stripFrontMatter, ACT_TOPICS } from '../src/lib/acts'
+import { RAW_SOURCE_MAX_CHARS } from '../src/lib/shortsPipeline'
 
 interface Args {
   act: string
@@ -136,7 +137,7 @@ async function main() {
         is_published: args.publish,
         review_status: args.publish ? 'approved' : 'pending',
         published_at: args.publish ? now : null,
-        raw_source: { act: args.act, section: section.number, text: section.text.slice(0, 200_000) },
+        raw_source: { act: args.act, section: section.number, text: section.text.slice(0, RAW_SOURCE_MAX_CHARS) },
       })
 
       if (error) {

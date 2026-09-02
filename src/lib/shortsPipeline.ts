@@ -12,6 +12,16 @@ import { FEED_SOURCES, fetchFeed, fetchArticleText, type FeedItem } from './sour
 const MIN_RELEVANCE = 3
 
 /**
+ * How much source text is retained per card.
+ *
+ * The summariser trims its input to 18,000 characters, so anything kept beyond
+ * that can never be read back — it was pure storage cost. Supabase's free tier
+ * is 500 MB; at the old 200,000-char cap a few thousand cards would have
+ * filled it.
+ */
+export const RAW_SOURCE_MAX_CHARS = 20_000
+
+/**
  * Pause between documents, sized to whichever provider is primary.
  */
 function pacingMs(): number {
@@ -82,7 +92,7 @@ async function insertSuggestion(
       confidence: suggestion.confidence,
       is_published: false,
       review_status: 'pending',
-      raw_source: { headline: item.title, text: sourceText.slice(0, 200_000) },
+      raw_source: { headline: item.title, text: sourceText.slice(0, RAW_SOURCE_MAX_CHARS) },
     })
     .select('id, title, relevance_score, confidence')
     .single()

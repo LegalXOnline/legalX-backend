@@ -64,3 +64,17 @@ jobs:
           if [ "${proposed:-0}" = "0" ]; then
             echo "::warning::No suggestions proposed today — check the skipped reasons in the response above"
           fi
+
+      - name: Weekly housekeeping
+        # Sundays only. Prunes read notifications, expired call rings and
+        # stale audit rows so the 500 MB Supabase allowance stays available
+        # for actual content.
+        if: github.event.schedule == '30 2 * * *'
+        run: |
+          if [ "$(date -u +%u)" = "7" ]; then
+            curl -s -m 120 -X POST \
+              -H "x-admin-secret: ${{ secrets.ADMIN_SECRET }}" \
+              "${{ secrets.BACKEND_URL }}/api/jobs/retention" || true
+          else
+            echo "Not Sunday — skipping retention sweep"
+          fi
