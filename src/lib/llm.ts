@@ -264,10 +264,18 @@ async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt
 
   if (!res.ok) {
     const body = await res.text().catch(() => '')
-    // 401/403 = bad or revoked key, 429 = quota exhausted. All mean "use the
-    // fallback and tell someone", as distinct from a transient 5xx.
-    if ([401, 403, 429].includes(res.status)) {
-      throw new ProviderUnavailable('Gemini', `HTTP ${res.status}: ${body.slice(0, 200)}`)
+
+    // Google reports a bad or revoked key as 400 with API_KEY_INVALID, not 401
+    // — checking status alone let a dead key fall through as a generic error
+    // and never reach the fallback.
+    const keyOrQuotaProblem =
+      res.status === 401 ||
+      res.status === 403 ||
+      res.status === 429 ||
+      /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota/i.test(body)
+
+    if (keyOrQuotaProblem) {
+      throw new ProviderUnavailable('Gemini', `HTTP ${res.status}: ${body.slice(0, 180)}`)
     }
     logger.error({ status: res.status, body: body.slice(0, 300) }, 'Gemini request failed')
     throw new Error(`Summarisation failed (${res.status}).`)
