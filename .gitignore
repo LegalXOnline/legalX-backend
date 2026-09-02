@@ -1,4 +1,11 @@
 node_modules
 dist
 .env
+.env.local
+
+# Bare Act texts: bulky, and each deployment supplies its own.
 data/acts/*.txt
+
+# macOS resource forks — these were being committed.
+._*
+.DS_Store
