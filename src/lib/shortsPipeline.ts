@@ -2,6 +2,7 @@ import crypto from 'crypto'
 import { supabase } from './supabase'
 import { logger } from './logger'
 import { summariseSource, slugify, type Suggestion } from './llm'
+import { relevanceGate, dedupeKey, isNearDuplicate, type GateVerdict } from './gate'
 import { FEED_SOURCES, fetchFeed, fetchArticleText, type FeedItem } from './sources/rss'
 
 /**
@@ -229,7 +230,8 @@ async function dropAlreadySeen(items: FeedItem[]): Promise<FeedItem[]> {
 async function insertSuggestion(
   item: FeedItem,
   suggestion: Suggestion,
-  sourceText: string
+  sourceText: string,
+  gate?: GateVerdict
 ): Promise<{ id: string; title: string; relevance_score: number | null; confidence: string | null } | null> {
   const { data, error } = await supabase
     .from('shorts_cards')
@@ -238,9 +240,23 @@ async function insertSuggestion(
       slug: slugify(suggestion.title, urlHash(item.link)),
       summary: suggestion.summary,
       takeaway: suggestion.takeaway || null,
-      category: suggestion.category,
+      // Tier drives ordering: high-relevance cards surface first in both the
+      // review queue and the public feed.
+      // The gate is the authority on category — it saw the same text and its
+      // whole job was classification. The generator's guess is a fallback.
+      category: gate?.category && gate.category !== 'none' ? gate.category : suggestion.category,
       court: suggestion.court,
       judgment_date: parsePubDate(item.pubDate),
+      dedupe_key: dedupeKey(suggestion.title),
+      audience: gate?.audience ?? null,
+      affects_whom: suggestion.affectsWhom || gate?.affectsWhom || null,
+      action_required: suggestion.actionRequired,
+      deadline: suggestion.deadline,
+      expires_on: gate?.expiresOn ?? suggestion.deadline,
+      key_points: suggestion.keyPoints,
+      statute_reference: suggestion.statuteReference,
+      gate_reason: gate?.reason ?? null,
+      relevance_tier: gate?.tier ?? null,
       source_url: item.link,
       source_name: item.sourceName,
       source_feed: item.sourceFeed,
@@ -366,6 +382,48 @@ export async function runIngest(opts: {
         continue
       }
 
+      // ── Stage 1: relevance gate ──────────────────────────────────────────
+      // A cheap yes/no before the expensive generator. Most regulator items
+      // stop here, which is the point — the generator can only ever write a
+      // card, so it must not be shown things that should not become one.
+      const verdict = await relevanceGate(sourceText, {
+        title: item.title,
+        sourceName: item.sourceName,
+      })
+
+      if (!verdict.cardWorthy) {
+        report.skipped.push({
+          title: item.title.slice(0, 90),
+          reason: `Gate: ${verdict.reason}`,
+        })
+        continue
+      }
+
+      // Near-duplicate check on the normalised headline. Two VRRR notices a
+      // day apart are different URLs and the same card, so source_url alone
+      // cannot catch them.
+      const key = dedupeKey(item.title)
+      if (key.length > 12) {
+        // Compare against recent keys by token overlap, not equality — the
+        // same story rarely arrives with an identical headline.
+        const { data: recent } = await supabase
+          .from('shorts_cards')
+          .select('dedupe_key')
+          .not('dedupe_key', 'is', null)
+          .order('created_at', { ascending: false })
+          .limit(300)
+
+        const twin = (recent ?? []).find(r => isNearDuplicate(key, String(r.dedupe_key)))
+        if (twin) {
+          report.skipped.push({
+            title: item.title.slice(0, 90),
+            reason: 'Near-duplicate of an existing card.',
+          })
+          continue
+        }
+      }
+
+      // ── Stage 2: card generator ──────────────────────────────────────────
       const result = await summariseSource(sourceText, {
         title: item.title,
         sourceName: item.sourceName,
@@ -376,15 +434,17 @@ export async function runIngest(opts: {
         continue
       }
 
-      if (result.relevanceScore < MIN_RELEVANCE) {
-        report.skipped.push({
-          title: item.title.slice(0, 90),
-          reason: `Relevance ${result.relevanceScore}/5 — below the ${MIN_RELEVANCE} threshold.`,
-        })
-        continue
+      // The generator's own confidence gates the queue: below 0.75 the audit
+      // spec requires mandatory human review, which is where it goes anyway,
+      // so it is kept but flagged rather than dropped.
+      if (result.unsupportedClaims.length > 0) {
+        logger.warn(
+          { title: result.title, claims: result.unsupportedClaims },
+          'generator self-reported unsupported claims'
+        )
       }
 
-      const inserted = await insertSuggestion(item, result, sourceText)
+      const inserted = await insertSuggestion(item, result, sourceText, verdict)
       if (inserted) {
         report.suggestions.push(inserted)
         report.proposed += 1

@@ -100,6 +100,15 @@ export interface Suggestion {
   /** 1–5: how much this matters to an ordinary citizen. */
   relevanceScore: number
   confidence: 'high' | 'medium' | 'low'
+  affectsWhom: string
+  actionRequired: 'yes' | 'no' | 'conditional'
+  deadline: string | null
+  keyPoints: string[]
+  statuteReference: string | null
+  /** 0–1 self-assessment. Below 0.75 forces human review. */
+  confidenceScore: number
+  /** The model's own list of claims the source does not support. */
+  unsupportedClaims: string[]
 }
 
 export interface SkippedSuggestion {
@@ -156,35 +165,85 @@ Respond with ONLY a JSON object, no markdown fence:
  *      rather than inventing something to satisfy the schema.
  *   4. A relevance score, so thin or irrelevant items are filtered automatically.
  */
-const SYSTEM_PROMPT = `You summarise Indian legal and government material for ordinary citizens on a legal-services platform.
+const SYSTEM_PROMPT = `You write short legal-awareness cards for ordinary Indians. Your reader has no
+legal training, is not a banker, and is reading on a phone. They came because
+something in their life might be affected.
 
-ABSOLUTE RULES — these override everything else:
-1. Use ONLY the text supplied by the user. Never add facts from your own knowledge, however confident you are.
-2. Never state a legal holding, section number, penalty, date or amount that does not appear verbatim in the supplied text.
-3. If the text is truncated, boilerplate, a navigation page, or too thin to summarise accurately, respond with {"skip": true, "reason": "..."} and nothing else.
-4. Never give legal advice, predict outcomes, or tell the reader what they should do. Describe what the source says.
-5. If you are unsure whether something is accurate, skip it. A skipped item costs nothing; a wrong one is a liability.
+ABSOLUTE RULES
+1. Use ONLY the source text provided. If the text does not state something,
+   leave it out. Never add section numbers, Act names, dates, penalty amounts,
+   or case names from your own knowledge.
+2. Never say what the reader "should" do about their own situation. Explain
+   what the rule is and what it requires. Advice is the lawyer's job, not the
+   card's.
+3. If the source is unclear on a point, say the source does not specify it
+   rather than filling the gap.
+4. Write in plain English. Any legal term you must use, explain in the same
+   sentence in ordinary words.
+5. Never use a repealed statute as if it were current. The Indian Penal Code,
+   the Code of Criminal Procedure and the Indian Evidence Act were replaced on
+   1 July 2024 by the Bharatiya Nyaya Sanhita, the Bharatiya Nagarik Suraksha
+   Sanhita and the Bharatiya Sakshya Adhiniyam. If the source text is about a
+   repealed law, say so explicitly in the summary.
 
-You must quote the source. The "evidence" field must be an EXACT substring copied character-for-character from the supplied text — one sentence that supports your summary. Do not paraphrase it, do not fix its grammar, do not add ellipses. If you cannot find such a sentence, skip the item.
+FIELDS
 
-Write for a reader with no legal training. Plain English, short sentences, no Latin unless the source turns on the term and you gloss it.
+headline (max 70 characters)
+  What changed, in the reader's words. No clickbait, no questions, no
+  "Everything you need to know". A person scanning a feed should understand
+  the change from the headline alone.
 
-The summary must be 150-200 words. If the source does not contain enough substance to support 150 words without padding or repetition, skip the item rather than stretching it.
+summary (180-220 words)
+  What the rule now is and what changed. Concrete over abstract: real numbers,
+  real deadlines, real thresholds — but only ones the source states. Lead with
+  the change, not the background. No sentence that only restates the headline.
 
-Respond with ONLY a JSON object, no markdown fence:
+what_it_means (max 200 characters, one or two sentences)
+  The single most useful consequence, for a named kind of person. Start with
+  who: "If you rent a flat in Delhi..." / "For anyone who has filed a consumer
+  complaint...". Never write "no action is required" — if that is the honest
+  answer, this item should not have reached you, and you must set
+  confidence below 0.3 and say so in unsupported_claims.
+
+affects_whom (max 100 characters)
+  The specific group. "Tenants in Maharashtra", not "the general public".
+
+action_required
+  "yes" if the reader must do something by a date, "no" if it changes their
+  rights without requiring action, "conditional" if only in some situations.
+
+deadline
+  YYYY-MM-DD if the source states one, else null. Never invent a date.
+
+key_points (2-4 items, max 90 characters each)
+  The facts a reader would want to remember. Each must be traceable to a
+  specific statement in the source.
+
+statute_reference
+  Exact Act, section, circular, or case name as stated in the source. If the
+  source does not name one, use null. Never construct a citation.
+
+evidence
+  One sentence copied EXACTLY, character for character, from the source text,
+  which supports the summary. Do not paraphrase or tidy it. If you cannot find
+  one, set confidence below 0.3.
+
+confidence (0.0-1.0)
+  How well the source supports the card as written. Below 0.75 sends it to
+  mandatory human review.
+
+unsupported_claims (array, usually empty)
+  Any statement in your own output that the source text does not directly
+  support. Be honest here — this is the safety net, not a formality. An empty
+  array on a card that stretched the source is worse than admitting the stretch.
+
+Return JSON only, with exactly these keys:
 {
-  "title": "under 90 characters, states what happened, not the case name",
-  "summary": "150-200 words: the background, what was decided or announced, the reasoning, and who it affects. Write in short paragraphs, not one block.",
-  "takeaway": "1-2 sentences on the practical effect for an ordinary person",
-  "category": "one of: ${CATEGORIES.join(', ')}",
-  "court": "the deciding court or issuing body, or null",
-  "tags": ["3-5 lowercase topic keywords"],
-  "evidence": "one sentence copied EXACTLY from the supplied text",
-  "relevanceScore": 1-5,
-  "confidence": "high | medium | low"
-}
-
-relevanceScore: 5 = affects most citizens directly (a new consumer right, a traffic penalty change). 1 = of interest only to specialists (a procedural direction, a corporate merger approval).`
+  "headline": "", "summary": "", "what_it_means": "", "affects_whom": "",
+  "action_required": "yes|no|conditional", "deadline": null,
+  "key_points": [], "statute_reference": null, "evidence": "",
+  "confidence": 0.0, "unsupported_claims": []
+}`
 
 /** Strips a ```json fence if the model adds one despite instructions. */
 function extractJson(raw: string): string {
@@ -242,7 +301,23 @@ class ProviderUnavailable extends Error {
 }
 
 // ── Gemini ────────────────────────────────────────────────────────────────────
-async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt: string): Promise<string> {
+/**
+ * Transient upstream errors — 500, 502, 503, 504.
+ *
+ * These are not quota problems and say nothing about the key, so falling
+ * straight to the backup provider would be wrong; the right move is to wait a
+ * moment and ask again. A 503 from Gemini killed a whole run before this.
+ */
+const TRANSIENT_STATUSES = new Set([500, 502, 503, 504])
+const MAX_TRANSIENT_RETRIES = 3
+
+async function callGemini(
+  cfg: ProviderConfig,
+  userContent: string,
+  systemPrompt: string,
+  maxTokens?: number,
+  attempt = 0
+): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.model}:generateContent`
 
   const res = await fetch(url, {
@@ -256,7 +331,7 @@ async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt
         // Generous, because on thinking-capable models the reasoning is billed
         // against this budget before any JSON is emitted. Too low and responses
         // arrive truncated, which reads as "malformed output".
-        maxOutputTokens: 8000,
+        maxOutputTokens: maxTokens ?? 8000,
         // Gemini can enforce the shape server-side, which removes the whole
         // class of "model wrapped the JSON in prose" failures.
         responseMimeType: 'application/json',
@@ -284,7 +359,21 @@ async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt
     if (keyOrQuotaProblem) {
       throw new ProviderUnavailable('Gemini', `HTTP ${res.status}: ${body.slice(0, 180)}`)
     }
+    // Retry transient upstream failures with exponential backoff before
+    // giving up on this provider.
+    if (TRANSIENT_STATUSES.has(res.status) && attempt < MAX_TRANSIENT_RETRIES) {
+      const wait = 2 ** attempt * 1500
+      logger.warn({ status: res.status, attempt: attempt + 1, wait }, 'Gemini transient error — retrying')
+      await sleep(wait)
+      return callGemini(cfg, userContent, systemPrompt, maxTokens, attempt + 1)
+    }
+
     logger.error({ status: res.status, body: body.slice(0, 300) }, 'Gemini request failed')
+    // Exhausted retries on a transient error means this provider is not
+    // answering — hand over to the fallback rather than failing the run.
+    if (TRANSIENT_STATUSES.has(res.status)) {
+      throw new ProviderUnavailable('Gemini', `HTTP ${res.status} after ${MAX_TRANSIENT_RETRIES} retries`)
+    }
     throw new Error(`Summarisation failed (${res.status}).`)
   }
 
@@ -303,7 +392,8 @@ async function callOpenAiCompatible(
   cfg: ProviderConfig,
   userContent: string,
   systemPrompt: string,
-  attempt = 0
+  attempt = 0,
+  maxTokens?: number
 ): Promise<string> {
   const url = cfg.name === 'openrouter'
     ? 'https://openrouter.ai/api/v1/chat/completions'
@@ -318,7 +408,7 @@ async function callOpenAiCompatible(
       // gpt-oss is a reasoning model: its chain of thought is billed against
       // this budget before a single character of JSON is emitted. Too low and
       // responses arrive truncated mid-string.
-      max_tokens: 3000,
+      max_tokens: maxTokens ?? 3000,
       reasoning_effort: 'low',
       messages: [
         { role: 'system', content: systemPrompt },
@@ -336,7 +426,7 @@ async function callOpenAiCompatible(
     if (attempt === 0 && waitSeconds > 0 && waitSeconds < 30) {
       logger.info({ waitSeconds }, 'LLM rate limited — waiting and retrying once')
       await sleep(Math.ceil(waitSeconds * 1000) + 500)
-      return callOpenAiCompatible(cfg, userContent, systemPrompt, attempt + 1)
+      return callOpenAiCompatible(cfg, userContent, systemPrompt, attempt + 1, maxTokens)
     }
     throw new ProviderUnavailable(cfg.name, 'Rate limit exhausted')
   }
@@ -347,7 +437,18 @@ async function callOpenAiCompatible(
 
   if (!res.ok) {
     const body = await res.text().catch(() => '')
+
+    if (TRANSIENT_STATUSES.has(res.status) && attempt < MAX_TRANSIENT_RETRIES) {
+      const wait = 2 ** attempt * 1500
+      logger.warn({ status: res.status, attempt: attempt + 1, wait }, 'LLM transient error — retrying')
+      await sleep(wait)
+      return callOpenAiCompatible(cfg, userContent, systemPrompt, attempt + 1, maxTokens)
+    }
+
     logger.error({ status: res.status, body: body.slice(0, 300) }, 'LLM request failed')
+    if (TRANSIENT_STATUSES.has(res.status)) {
+      throw new ProviderUnavailable(cfg.name, `HTTP ${res.status} after ${MAX_TRANSIENT_RETRIES} retries`)
+    }
     throw new Error(`Summarisation failed (${res.status}).`)
   }
 
@@ -371,9 +472,29 @@ async function callOpenAiCompatible(
  * will not fix themselves within the run. A transient 5xx is not retried on the
  * fallback, because it says nothing about the primary's health.
  */
-async function callLlm(userContent: string, systemPrompt = SYSTEM_PROMPT): Promise<string> {
+/**
+ * Runs a prompt through the provider chain.
+ *
+ * Exported so the relevance gate can reuse the same fallback and alerting
+ * without duplicating it, while pointing at a cheaper model.
+ */
+export async function callModel(
+  userContent: string,
+  systemPrompt: string,
+  opts: { model?: string; maxTokens?: number } = {}
+): Promise<string> {
+  return callLlm(userContent, systemPrompt, opts)
+}
+
+async function callLlm(
+  userContent: string,
+  systemPrompt = SYSTEM_PROMPT,
+  opts: { model?: string; maxTokens?: number } = {}
+): Promise<string> {
   const chain = providerChain()
-  const configured = chain.map(configFor).filter(c => c.apiKey)
+  const configured = chain.map(configFor)
+    .map(c => opts.model && c.name === 'gemini' ? { ...c, model: opts.model } : c)
+    .filter(c => c.apiKey)
 
   if (configured.length === 0) {
     throw new Error(
@@ -387,8 +508,8 @@ async function callLlm(userContent: string, systemPrompt = SYSTEM_PROMPT): Promi
     const cfg = configured[i]
     try {
       const content = cfg.name === 'gemini'
-        ? await callGemini(cfg, userContent, systemPrompt)
-        : await callOpenAiCompatible(cfg, userContent, systemPrompt)
+        ? await callGemini(cfg, userContent, systemPrompt, opts.maxTokens)
+        : await callOpenAiCompatible(cfg, userContent, systemPrompt, 0, opts.maxTokens)
       if (i > 0) {
         logger.warn({ provider: cfg.name }, 'summarised via fallback provider')
       }
@@ -437,37 +558,70 @@ function parseSuggestion(content: string, sourceForEvidence: string): Suggestion
     return { skipped: true, reason: String(parsed.reason ?? 'Model declined to summarise.') }
   }
 
-  const title = String(parsed.title ?? '').trim().slice(0, 255)
+  // The generator emits `headline`; the statute path still emits `title`.
+  const title = String(parsed.headline ?? parsed.title ?? '').trim().slice(0, 255)
   const summary = String(parsed.summary ?? '').trim()
+  const takeaway = String(parsed.what_it_means ?? parsed.takeaway ?? '').trim()
   const evidence = String(parsed.evidence ?? '').trim()
 
   if (!title || !summary) {
-    return { skipped: true, reason: 'Model produced no title or summary.' }
+    return { skipped: true, reason: 'Model produced no headline or summary.' }
+  }
+
+  const confidenceScore = Number(parsed.confidence)
+  const score = Number.isFinite(confidenceScore) ? Math.min(1, Math.max(0, confidenceScore)) : 0.5
+
+  const unsupported = Array.isArray(parsed.unsupported_claims)
+    ? parsed.unsupported_claims.map((c: unknown) => String(c)).filter(Boolean)
+    : []
+
+  // The prompt requires the model to flag this itself when the honest answer
+  // is "nothing changes for you". Trust it and drop the card.
+  if (/no (immediate )?action (is )?required/i.test(takeaway)) {
+    return { skipped: true, reason: 'Card states no action is required — not useful to a reader.' }
+  }
+
+  if (score < 0.3) {
+    return { skipped: true, reason: `Model reported confidence ${score.toFixed(2)} — too low to keep.` }
   }
 
   if (!verifyEvidence(evidence, sourceForEvidence)) {
-    logger.warn({ title, evidence: evidence.slice(0, 120) }, 'evidence not found in source — discarding suggestion')
+    logger.warn({ title, evidence: evidence.slice(0, 120) }, 'evidence not found in source — discarding')
     return {
       skipped: true,
       reason: 'Supporting quote could not be located in the source — possible fabrication.',
     }
   }
 
-  const relevance = Number(parsed.relevanceScore)
-  const confidence = ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'low'
+  const action = ['yes', 'no', 'conditional'].includes(parsed.action_required)
+    ? parsed.action_required : 'no'
 
   return {
     title,
     summary,
-    takeaway: String(parsed.takeaway ?? '').trim(),
-    category: (CATEGORIES as readonly string[]).includes(parsed.category) ? parsed.category : 'Civil',
+    takeaway,
+    // Category is decided by the gate, which sees the same text and is the
+    // single authority on it. Anything here is a placeholder the caller
+    // overwrites.
+    category: String(parsed.category ?? 'money_consumer'),
     court: parsed.court ? String(parsed.court).trim().slice(0, 150) : null,
     tags: Array.isArray(parsed.tags)
       ? parsed.tags.slice(0, 6).map((t: unknown) => String(t).toLowerCase().trim()).filter(Boolean)
       : [],
     evidence,
-    relevanceScore: Number.isFinite(relevance) ? Math.min(5, Math.max(1, Math.round(relevance))) : 3,
-    confidence,
+    // Map the 0–1 self-assessment onto the 1–5 scale the queue sorts by.
+    relevanceScore: Math.max(1, Math.min(5, Math.round(score * 5))),
+    confidence: score >= 0.85 ? 'high' : score >= 0.75 ? 'medium' : 'low',
+    affectsWhom: String(parsed.affects_whom ?? '').slice(0, 100),
+    actionRequired: action,
+    deadline: typeof parsed.deadline === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.deadline)
+      ? parsed.deadline : null,
+    keyPoints: Array.isArray(parsed.key_points)
+      ? parsed.key_points.slice(0, 4).map((k: unknown) => String(k).slice(0, 90)).filter(Boolean)
+      : [],
+    statuteReference: parsed.statute_reference ? String(parsed.statute_reference).slice(0, 200) : null,
+    confidenceScore: score,
+    unsupportedClaims: unsupported,
   }
 }
 
