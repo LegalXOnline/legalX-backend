@@ -29,7 +29,7 @@ import {
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
-import { startIngest, getIngestJob, draftFromSource } from '../lib/shortsPipeline'
+import { startIngest, getIngestJob, cancelIngest, draftFromSource } from '../lib/shortsPipeline'
 import { FEED_SOURCES } from '../lib/sources/rss'
 
 const router = Router()
@@ -1338,6 +1338,14 @@ router.post('/shorts/auto-ingest', requireAdmin, validateBody(shortsAutoIngestSc
 // ── GET /api/admin/shorts/ingest-status ──────────────────────────────────────
 router.get('/shorts/ingest-status', requireAdmin, (_req: Request, res: Response) => {
   res.json(getIngestJob())
+})
+
+// ── POST /api/admin/shorts/ingest-cancel ─────────────────────────────────────
+// Stops the current run. Co-operative rather than abortive: the run finishes
+// whatever call is in flight, then stops, so nothing is left half-written.
+// Everything already produced stays in the review queue.
+router.post('/shorts/ingest-cancel', requireAdmin, (_req: Request, res: Response) => {
+  res.json(cancelIngest())
 })
 
 // ── GET /api/admin/shorts/feeds ──────────────────────────────────────────────

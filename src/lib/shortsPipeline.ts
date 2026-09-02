@@ -126,7 +126,7 @@ const MAX_COOLDOWNS = Number(process.env.SHORTS_MAX_COOLDOWNS ?? 3)
  * own runs.
  */
 export interface IngestJob {
-  status: 'idle' | 'running' | 'done' | 'failed'
+  status: 'idle' | 'running' | 'done' | 'failed' | 'cancelled'
   startedAt: string | null
   finishedAt: string | null
   /** Candidates processed so far, and how many there are in total. */
@@ -148,6 +148,39 @@ export function getIngestJob(): IngestJob {
 }
 
 /**
+ * Co-operative cancellation.
+ *
+ * A run can sit in a 65-second quota cooldown, so the flag is checked both
+ * between items and inside the sleep — otherwise "Stop" would appear to do
+ * nothing for a minute. Whatever the run already produced is kept: those cards
+ * are in the review queue and are still useful.
+ */
+let cancelRequested = false
+
+export function cancelIngest(): IngestJob {
+  if (currentJob.status === 'running') {
+    cancelRequested = true
+    logger.info({}, 'ingest: cancellation requested')
+  }
+  return currentJob
+}
+
+function isCancelled(): boolean {
+  return cancelRequested
+}
+
+/** Sleeps in slices so a cancellation does not have to wait out the whole wait. */
+async function interruptibleSleep(ms: number): Promise<void> {
+  const slice = 500
+  let waited = 0
+  while (waited < ms) {
+    if (isCancelled()) return
+    await sleep(Math.min(slice, ms - waited))
+    waited += slice
+  }
+}
+
+/**
  * Starts a run in the background if one is not already going.
  *
  * Returns immediately. Refusing to start a second concurrent run matters:
@@ -157,6 +190,7 @@ export function getIngestJob(): IngestJob {
 export function startIngest(opts: { feeds?: string[]; target?: number } = {}): IngestJob {
   if (currentJob.status === 'running') return currentJob
 
+  cancelRequested = false
   currentJob = {
     status: 'running',
     startedAt: new Date().toISOString(),
@@ -181,7 +215,13 @@ export function startIngest(opts: { feeds?: string[]; target?: number } = {}): I
     },
   })
     .then(report => {
-      currentJob = { ...currentJob, status: 'done', finishedAt: new Date().toISOString(), report }
+      currentJob = {
+        ...currentJob,
+        status: cancelRequested ? 'cancelled' : 'done',
+        finishedAt: new Date().toISOString(),
+        report,
+      }
+      cancelRequested = false
     })
     .catch(err => {
       currentJob = {
@@ -190,6 +230,7 @@ export function startIngest(opts: { feeds?: string[]; target?: number } = {}): I
         finishedAt: new Date().toISOString(),
         error: err?.message ?? 'Ingest failed',
       }
+      cancelRequested = false
     })
 
   return currentJob
@@ -363,10 +404,18 @@ export async function runIngest(opts: {
     retryItem = null
     index += 1
     if (report.proposed >= target) break
+
+    if (isCancelled()) {
+      report.stoppedEarly = true
+      report.stopReason = 'Stopped by the operator.'
+      report.remaining = queue.length
+      break
+    }
+
     opts.onProgress?.(report.proposed, target)
 
     // Pace from the second document onward; the first costs nothing to start.
-    if (processed > 0) await sleep(pacingMs())
+    if (processed > 0) await interruptibleSleep(pacingMs())
     processed += 1
 
     try {
@@ -492,7 +541,13 @@ export async function runIngest(opts: {
           'ingest: quota reached, pausing before retry'
         )
         opts.onCooldown?.(cooldowns, COOLDOWN_MS)
-        await sleep(COOLDOWN_MS)
+        await interruptibleSleep(COOLDOWN_MS)
+        if (isCancelled()) {
+          report.stoppedEarly = true
+          report.stopReason = 'Stopped by the operator during a quota pause.'
+          report.remaining = queue.length + 1
+          break
+        }
         retryItem = item          // put it back at the front
         continue
       }
@@ -512,7 +567,11 @@ export async function runIngest(opts: {
   // their attention is freshest.
   report.suggestions.sort((a, b) => (b.relevance_score ?? 0) - (a.relevance_score ?? 0))
 
-  if (report.stoppedEarly) {
+  if (report.stopReason?.startsWith('Stopped by the operator')) {
+    report.message = report.proposed > 0
+      ? `Stopped. ${report.proposed} suggestion${report.proposed === 1 ? '' : 's'} were saved before you cancelled.`
+      : 'Stopped before anything was created.'
+  } else if (report.stoppedEarly) {
     report.message = report.proposed > 0
       ? `Added ${report.proposed}, then stopped: ${report.stopReason} ${report.remaining ?? 0} candidates are still queued — run again in a minute to continue.`
       : `${report.stopReason} Nothing was added. Try again shortly.`
