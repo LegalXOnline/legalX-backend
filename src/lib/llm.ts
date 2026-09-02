@@ -253,10 +253,17 @@ async function callGemini(cfg: ProviderConfig, userContent: string, systemPrompt
       contents: [{ role: 'user', parts: [{ text: userContent }] }],
       generationConfig: {
         temperature: 0.15,
-        maxOutputTokens: 2000,
+        // Generous, because on thinking-capable models the reasoning is billed
+        // against this budget before any JSON is emitted. Too low and responses
+        // arrive truncated, which reads as "malformed output".
+        maxOutputTokens: 8000,
         // Gemini can enforce the shape server-side, which removes the whole
         // class of "model wrapped the JSON in prose" failures.
         responseMimeType: 'application/json',
+        // This task is extraction against a supplied text, not a problem that
+        // rewards deliberation. Newer Gemini models think by default and either
+        // time out or exhaust the output budget doing it.
+        thinkingConfig: { thinkingBudget: 0 },
       },
     }),
     signal: AbortSignal.timeout(90_000),

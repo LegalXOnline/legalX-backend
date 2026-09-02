@@ -144,15 +144,27 @@ if (isProduction) {
   app.set('trust proxy', 1) // trust Render's single-hop load balancer
 }
 
-// Global rate limit — 100 req / 15 min per IP
+// ── Global rate limit ─────────────────────────────────────────────────────────
+// A blunt DoS guard, not a business rule. The routes that actually need tight
+// limits (login, password reset) carry their own, much stricter, limiters.
+//
+// The cap is high on purpose. Every browser request reaches this service
+// through the Next.js rewrite on Vercel, so the backend sees Vercel's egress
+// IP rather than the visitor's — which means all users share a single bucket.
+// At 100/15min the whole site locked itself out within minutes of any real use,
+// surfacing to users as "Server is unavailable".
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: Number(process.env.GLOBAL_RATE_LIMIT ?? 3000),
   standardHeaders: true,
   legacyHeaders: false,
   // In development (no proxy), suppress the X-Forwarded-For validation error.
   // In production trust proxy is set above so this is already safe.
   validate: { xForwardedForHeader: isProduction },
+  // Health checks and secret-authenticated jobs must never be throttled: the
+  // keep-alive ping and the daily cron would otherwise consume the shared
+  // budget and then be refused by it.
+  skip: req => req.path === '/health' || req.path.startsWith('/api/jobs'),
 }))
 
 

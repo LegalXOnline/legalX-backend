@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import { logger } from '../lib/logger'
 import { runIngest } from '../lib/shortsPipeline'
 import { FEED_SOURCES } from '../lib/sources/rss'
+import { supabase } from '../lib/supabase'
 
 const router = Router()
 
@@ -62,6 +63,58 @@ router.post('/shorts-daily', requireJobSecret, async (req: Request, res: Respons
     // than the feed quietly going stale for a week.
     res.status(500).json({ error: message })
   }
+})
+
+// ── POST /api/jobs/retention ─────────────────────────────────────────────────
+// Housekeeping. Supabase's free tier is 500 MB and three tables grow without
+// bound: notifications, audit_log, and the short-lived call-ring table. Left
+// alone they would quietly consume the allowance the actual content needs.
+//
+// Deliberately conservative: audit records are a compliance artefact, so they
+// are kept for two years, and only *read* notifications are pruned.
+router.post('/retention', requireJobSecret, async (_req: Request, res: Response) => {
+  const now = Date.now()
+  const daysAgo = (n: number) => new Date(now - n * 86_400_000).toISOString()
+
+  const results: Record<string, number | string> = {}
+
+  const prune = async (
+    label: string,
+    run: () => Promise<{ count: number | null; error: any }>
+  ) => {
+    try {
+      const { count, error } = await run()
+      results[label] = error ? `error: ${error.message}` : (count ?? 0)
+    } catch (err: any) {
+      results[label] = `error: ${err?.message ?? 'unknown'}`
+    }
+  }
+
+  // Read notifications older than 60 days: the user has seen them.
+  await prune('notifications_read', async () =>
+    supabase.from('notifications').delete({ count: 'exact' })
+      .eq('is_read', true).lt('created_at', daysAgo(60)))
+
+  // Unread ones linger longer — but a year-old unread notice helps nobody.
+  await prune('notifications_unread', async () =>
+    supabase.from('notifications').delete({ count: 'exact' })
+      .eq('is_read', false).lt('created_at', daysAgo(365)))
+
+  // Ring signals expire in seconds; anything from yesterday is dead weight.
+  await prune('call_rings', async () =>
+    supabase.from('consultation_notifications').delete({ count: 'exact' })
+      .lt('created_at', daysAgo(1)))
+
+  // Rejected shorts keep their decision record but not their source text.
+  await prune('rejected_source_text', async () =>
+    supabase.from('shorts_cards').update({ raw_source: null }, { count: 'exact' })
+      .eq('review_status', 'rejected').not('raw_source', 'is', null))
+
+  await prune('audit_log', async () =>
+    supabase.from('audit_log').delete({ count: 'exact' }).lt('created_at', daysAgo(730)))
+
+  logger.info({ results }, '[jobs] retention sweep complete')
+  res.json({ ok: true, results })
 })
 
 // ── GET /api/jobs/health ─────────────────────────────────────────────────────

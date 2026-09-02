@@ -1346,7 +1346,10 @@ router.post('/shorts/bulk', requireAdmin, validateBody(shortsBulkSchema), async 
 
     const update = action === 'approve'
       ? { review_status: 'approved', is_published: true, published_at: now, reviewed_by: (req as any).user.id, updated_at: now }
-      : { review_status: 'rejected', is_published: false, rejected_reason: reason ?? null, reviewed_by: (req as any).user.id, updated_at: now }
+      // Rejected cards are kept as the record of what was declined, but their
+      // stored source text is released — it exists only to re-summarise, and a
+      // rejected card never will be.
+      : { review_status: 'rejected', is_published: false, rejected_reason: reason ?? null, reviewed_by: (req as any).user.id, updated_at: now, raw_source: null }
 
     const { data, error } = await supabase
       .from('shorts_cards')
