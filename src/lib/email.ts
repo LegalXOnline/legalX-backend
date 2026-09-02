@@ -371,6 +371,55 @@ export async function sendLawyerOnboardingWelcome(email: string, firstName: stri
   }
 }
 
+// ── Ops alert: summarisation provider degraded ────────────────────────────────
+// Throttled in-process so a burst of failures during one ingest run sends one
+// email, not thirty. Resets when the backend restarts, which is acceptable —
+// the alert is a nudge to check a key, not an incident pager.
+let lastProviderAlert = 0
+const PROVIDER_ALERT_INTERVAL_MS = 60 * 60 * 1000
+
+export async function sendProviderFailureAlert(opts: {
+  provider: string
+  reason: string
+  fallbackProvider: string | null
+}): Promise<void> {
+  if (Date.now() - lastProviderAlert < PROVIDER_ALERT_INTERVAL_MS) return
+  lastProviderAlert = Date.now()
+
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `⚠️ LegalX: ${opts.provider} summarisation is failing`,
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 8px;color:#111;font-size:20px">Summarisation provider failing</h2>
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 20px">
+            The Knowledge Center pipeline could not reach <strong>${opts.provider}</strong>.
+            ${opts.fallbackProvider
+              ? `It has fallen back to <strong>${opts.fallbackProvider}</strong>, so cards are still being produced — but on a smaller free tier.`
+              : 'There is no fallback configured, so no new cards are being produced.'}
+          </p>
+          <div style="background:#FFF5F5;border-left:4px solid #EF4444;padding:16px 20px;border-radius:4px;margin-bottom:24px">
+            <p style="margin:0 0 6px;color:#7F1D1D;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">Reason</p>
+            <p style="margin:0;color:#991B1B;font-size:14px;line-height:1.6">${opts.reason}</p>
+          </div>
+          <p style="color:#555;font-size:14px;line-height:1.7">
+            Most likely causes: the API key has expired or been revoked, billing is
+            not enabled, or the daily free quota is exhausted.
+          </p>
+          <p style="color:#aaa;font-size:12px;margin-top:28px">
+            Sent at ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.
+            Further alerts are suppressed for one hour.
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendProviderFailureAlert failed:', err)
+  }
+}
+
 // ── Password reset ────────────────────────────────────────────────────────────
 // Sends a one-time code rather than a clickable link. Mail providers (Gmail,
 // Outlook, corporate scanners) pre-fetch links to check them for malware, and

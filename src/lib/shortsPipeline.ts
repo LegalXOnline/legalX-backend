@@ -12,14 +12,17 @@ import { FEED_SOURCES, fetchFeed, fetchArticleText, type FeedItem } from './sour
 const MIN_RELEVANCE = 3
 
 /**
- * Pause between documents.
- *
- * The Groq free tier allows 8,000 tokens per minute and a trimmed document runs
- * 2,000–4,000, so roughly two per minute is the ceiling. Without this the run
- * burns its allowance in the first few seconds and every remaining candidate
- * fails on a 429.
+ * Pause between documents, sized to whichever provider is primary.
  */
-const PACE_MS = Number(process.env.SHORTS_PACE_MS ?? 22_000)
+function pacingMs(): number {
+  const explicit = Number(process.env.SHORTS_PACE_MS)
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit
+  // Gemini's free tier allows 1,000,000 tokens per minute against Groq's 8,000,
+  // so it needs almost no pacing. Groq needs ~22s between documents or the run
+  // burns its allowance in seconds and every later candidate 429s.
+  const primary = process.env.SHORTS_LLM_PROVIDER ?? 'gemini'
+  return primary === 'gemini' ? 1_500 : 22_000
+}
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -28,6 +31,12 @@ export interface IngestReport {
   skipped: { title: string; reason: string }[]
   failed: { url: string; error: string }[]
   suggestions: { id: string; title: string; relevance_score: number | null; confidence: string | null }[]
+  /** Set when the run halted before reaching `target` — e.g. a quota ran out. */
+  stoppedEarly?: boolean
+  stopReason?: string
+  /** How many candidates were still unprocessed when it stopped. */
+  remaining?: number
+  message?: string
 }
 
 /** Stable id for a source URL, used to dedupe and to suffix slugs. */
@@ -132,11 +141,13 @@ export async function runIngest(opts: {
   logger.info({ candidates: candidates.length, target }, 'ingest: candidates after dedupe')
 
   let processed = 0
+  let index = 0
   for (const item of candidates) {
+    index += 1
     if (report.proposed >= target) break
 
     // Pace from the second document onward; the first costs nothing to start.
-    if (processed > 0) await sleep(PACE_MS)
+    if (processed > 0) await sleep(pacingMs())
     processed += 1
 
     try {
@@ -178,14 +189,35 @@ export async function runIngest(opts: {
     } catch (err: any) {
       const message = err?.message ?? 'unknown error'
       report.failed.push({ url: item.link, error: message })
-      // A rate limit or missing key will hit every remaining item too.
-      if (/rate limit|not configured/i.test(message)) break
+
+      // A quota or configuration problem applies to every remaining candidate,
+      // so stop rather than failing the rest one by one. Whatever was already
+      // inserted stays — a partial batch is a useful batch, and the rest can be
+      // picked up on the next run.
+      if (/rate limit|not configured|unavailable/i.test(message)) {
+        report.stoppedEarly = true
+        report.stopReason = /rate limit|unavailable/i.test(message)
+          ? 'Summarisation quota reached for now.'
+          : 'Summarisation is not configured.'
+        report.remaining = candidates.length - index
+        break
+      }
     }
   }
 
   // Best candidates first, so the editor reads the strongest suggestions while
   // their attention is freshest.
   report.suggestions.sort((a, b) => (b.relevance_score ?? 0) - (a.relevance_score ?? 0))
+
+  if (report.stoppedEarly) {
+    report.message = report.proposed > 0
+      ? `Added ${report.proposed}, then stopped: ${report.stopReason} ${report.remaining ?? 0} candidates are still queued — run again in a minute to continue.`
+      : `${report.stopReason} Nothing was added. Try again shortly.`
+  } else if (report.proposed === 0) {
+    report.message = candidates.length === 0
+      ? 'No new items in the feeds — everything has already been seen.'
+      : 'Every candidate was rejected by the grounding checks. See the reasons below.'
+  }
 
   logger.info(
     { proposed: report.proposed, skipped: report.skipped.length, failed: report.failed.length },
