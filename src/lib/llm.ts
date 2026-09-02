@@ -176,7 +176,9 @@ export function verifyEvidence(evidence: string, sourceText: string): boolean {
   return false
 }
 
-async function callLlm(userContent: string): Promise<string> {
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+async function callLlm(userContent: string, attempt = 0): Promise<string> {
   const { url, model, apiKey } = providerConfig()
   if (!apiKey) {
     throw new Error('Summarisation is not configured — set GROQ_API_KEY (or OPENROUTER_API_KEY).')
@@ -190,24 +192,53 @@ async function callLlm(userContent: string): Promise<string> {
       // Low temperature: this is extraction, not composition. Creativity here
       // means inventing holdings that were never in the source.
       temperature: 0.15,
-      max_tokens: 1100,
+      // gpt-oss is a reasoning model: its chain of thought is billed against
+      // this budget before a single character of JSON is emitted. At 1100 the
+      // reasoning consumed the allowance and responses arrived truncated
+      // mid-string, which surfaced as "malformed output".
+      max_tokens: 3000,
+      // Cuts reasoning length sharply. This task is extraction against a
+      // supplied text, not a problem that rewards deliberation.
+      reasoning_effort: 'low',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userContent },
       ],
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(90_000),
   })
+
+  if (res.status === 429) {
+    const body = await res.text().catch(() => '')
+    // Groq states the exact wait in the error body; honour it rather than
+    // guessing. One retry only — a second 429 means the minute is genuinely
+    // exhausted and the caller should stop.
+    const waitSeconds = Number(body.match(/try again in ([\d.]+)s/)?.[1] ?? 0)
+    if (attempt === 0 && waitSeconds > 0 && waitSeconds < 30) {
+      logger.info({ waitSeconds }, 'LLM rate limited — waiting and retrying once')
+      await sleep(Math.ceil(waitSeconds * 1000) + 500)
+      return callLlm(userContent, attempt + 1)
+    }
+    logger.error({ body: body.slice(0, 200) }, 'LLM rate limit exhausted')
+    throw new Error('Summarisation rate limit reached. Wait a minute and try again.')
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '')
     logger.error({ status: res.status, body: body.slice(0, 300) }, 'LLM request failed')
-    if (res.status === 429) throw new Error('Summarisation rate limit reached. Wait a minute and try again.')
     throw new Error(`Summarisation failed (${res.status}).`)
   }
 
   const payload: any = await res.json()
-  const content = payload?.choices?.[0]?.message?.content
+  const choice = payload?.choices?.[0]
+  const content = choice?.message?.content
+
+  // A truncated response is not malformed input — say which it is, so the fix
+  // is obvious from the logs.
+  if (choice?.finish_reason === 'length') {
+    logger.warn({ model }, 'LLM response hit the token cap and was truncated')
+    throw new Error('Summarisation was cut off before completing. Try again.')
+  }
   if (!content) throw new Error('Summarisation returned an empty response.')
   return content
 }

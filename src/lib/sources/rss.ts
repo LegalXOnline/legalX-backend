@@ -25,20 +25,32 @@ export interface FeedSource {
 
 export const FEED_SOURCES: FeedSource[] = [
   {
-    id: 'pib_all',
-    label: 'PIB — Government press releases',
-    url: 'https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3',
-    sourceName: 'Press Information Bureau',
+    id: 'rbi_press',
+    label: 'RBI — Press releases',
+    url: 'https://www.rbi.org.in/pressreleases_rss.xml',
+    sourceName: 'Reserve Bank of India',
     enabled: true,
-    licenceNote: 'Government of India press releases, published for public dissemination.',
+    licenceNote: 'Regulator press releases, published for public dissemination.',
   },
   {
-    id: 'pib_law',
-    label: 'PIB — Law & Justice',
-    url: 'https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3&PRID=0',
+    id: 'sebi',
+    label: 'SEBI — Press releases',
+    url: 'https://www.sebi.gov.in/sebirss.xml',
+    sourceName: 'Securities and Exchange Board of India',
+    enabled: true,
+    licenceNote: 'Regulator press releases, published for public dissemination.',
+  },
+  {
+    // Disabled: PIB returns 403 to any non-browser User-Agent. It publishes no
+    // robots.txt disallowing crawlers, so this is a blanket WAF filter rather
+    // than a stated policy — enable it only after setting SHORTS_USER_AGENT,
+    // and knowing that is what you are doing.
+    id: 'pib_all',
+    label: 'PIB — Government press releases (403s our crawler)',
+    url: 'https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3',
     sourceName: 'Press Information Bureau',
     enabled: false,
-    licenceNote: 'Government of India press releases, published for public dissemination.',
+    licenceNote: 'Blocked: returns 403 unless SHORTS_USER_AGENT is set to a browser string.',
   },
 ]
 
