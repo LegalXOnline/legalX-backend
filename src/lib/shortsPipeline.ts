@@ -1,7 +1,7 @@
 import crypto from 'crypto'
 import { supabase } from './supabase'
 import { logger } from './logger'
-import { summariseSource, slugify, type Suggestion } from './llm'
+import { summariseSource, verifyCard, slugify, type Suggestion, type VerifyResult } from './llm'
 import { relevanceGate, dedupeKey, isNearDuplicate, type GateVerdict } from './gate'
 import { FEED_SOURCES, fetchFeed, fetchArticleText, type FeedItem } from './sources/rss'
 
@@ -231,7 +231,8 @@ async function insertSuggestion(
   item: FeedItem,
   suggestion: Suggestion,
   sourceText: string,
-  gate?: GateVerdict
+  gate?: GateVerdict,
+  check?: VerifyResult
 ): Promise<{ id: string; title: string; relevance_score: number | null; confidence: string | null } | null> {
   const { data, error } = await supabase
     .from('shorts_cards')
@@ -257,6 +258,13 @@ async function insertSuggestion(
       statute_reference: suggestion.statuteReference,
       gate_reason: gate?.reason ?? null,
       relevance_tier: gate?.tier ?? null,
+      verified: check?.verified ?? null,
+      // Kept so a reviewer sees exactly what the check questioned, rather than
+      // a bare pass/fail.
+      verifier_notes: check && check.unsupported.length
+        ? check.unsupported.map(u => `[${u.severity}] ${u.claim} — ${u.problem}`).join('\n')
+        : null,
+      confidence_score: suggestion.confidenceScore,
       source_url: item.link,
       source_name: item.sourceName,
       source_feed: item.sourceFeed,
@@ -444,7 +452,20 @@ export async function runIngest(opts: {
         )
       }
 
-      const inserted = await insertSuggestion(item, result, sourceText, verdict)
+      // ── Stage 3: verifier ────────────────────────────────────────────────
+      // An independent pass over the generated card. A high-severity finding
+      // or a bad citation stops the card here rather than letting a reviewer
+      // catch it — or not.
+      const check = await verifyCard(result, sourceText)
+      if (!check.verified && check.unsupported.some(u => u.severity === 'high')) {
+        report.skipped.push({
+          title: item.title.slice(0, 90),
+          reason: `Verifier: ${check.unsupported.find(u => u.severity === 'high')?.problem ?? 'unsupported claim'}`,
+        })
+        continue
+      }
+
+      const inserted = await insertSuggestion(item, result, sourceText, verdict, check)
       if (inserted) {
         report.suggestions.push(inserted)
         report.proposed += 1
