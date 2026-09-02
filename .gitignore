@@ -1,8 +1,4 @@
-node_modules/
-dist/
+node_modules
+dist
 .env
-*.log
-
-# macOS
-._*
-.DS_Store
+data/acts/*.txt
