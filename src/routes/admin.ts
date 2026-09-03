@@ -26,6 +26,8 @@ import {
   shortsUpdateSchema,
   shortsBulkSchema,
   shortsAutoIngestSchema,
+  knowledgeBulkSchema,
+  knowledgeListQuerySchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
@@ -1518,6 +1520,136 @@ router.delete('/shorts/:id', requireAdmin, validateParams(uuidParamSchema), asyn
     })
 
     return res.json({ message: 'Short deleted' })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── Know Your Rights ──────────────────────────────────────────────────────────
+
+/**
+ * Reviewer attribution shown on the public card.
+ *
+ * Google weighs reviewer identity on YMYL pages, so this has to be a person a
+ * reader could plausibly hold to account — never an account UUID, and never
+ * the "dev-unauthenticated" placeholder the import carried.
+ */
+function reviewerName(user: any): string {
+  const meta = user?.user_metadata ?? {}
+  const name = [meta.first_name, meta.last_name].filter(Boolean).join(' ').trim()
+  return name || meta.full_name || user?.email || 'LegalX Editorial'
+}
+
+// ── GET /api/admin/knowledge ─────────────────────────────────────────────────
+// The review queue for the imported rights explainers. `pending` is the work
+// list: everything that has never been decided on.
+router.get('/knowledge', requireAdmin, validateQuery(knowledgeListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status, category, search, page, pageSize } = req.validatedQuery as any
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('knowledge_cards')
+      .select(
+        'id, slug, title, question, direct_answer, explanation, card_text, category, ' +
+        'case_reference, suggested_questions, source, source_url, cta_type, is_published, ' +
+        'rejected_reason, reviewed_by, last_reviewed_at, published_at, created_at',
+        { count: 'exact' }
+      )
+
+    if (status === 'published') query = query.eq('is_published', true)
+    else if (status === 'rejected') query = query.eq('is_published', false).not('rejected_reason', 'is', null)
+    else if (status === 'pending') query = query.eq('is_published', false).is('rejected_reason', null)
+
+    if (category && category !== 'all') query = query.eq('category', category)
+    if (search) {
+      const safe = String(search).replace(/[(),]/g, ' ').trim()
+      query = query.or(`title.ilike.%${safe}%,direct_answer.ilike.%${safe}%,case_reference.ilike.%${safe}%`)
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+
+    res.json({ cards: data ?? [], total: count ?? 0, page, pageSize })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── GET /api/admin/knowledge/counts ──────────────────────────────────────────
+router.get('/knowledge/counts', requireAdmin, async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { data, error } = await supabase
+      .from('knowledge_cards')
+      .select('category, is_published, rejected_reason')
+    if (error) throw error
+
+    const rows = (data ?? []) as { category: string; is_published: boolean; rejected_reason: string | null }[]
+    const byCategory = new Map<string, number>()
+    let pending = 0, published = 0, rejected = 0
+
+    for (const r of rows) {
+      if (r.is_published) published++
+      else if (r.rejected_reason) rejected++
+      else { pending++; byCategory.set(r.category, (byCategory.get(r.category) ?? 0) + 1) }
+    }
+
+    res.json({
+      pending, published, rejected, total: rows.length,
+      pendingByCategory: [...byCategory.entries()]
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count),
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── POST /api/admin/knowledge/bulk ───────────────────────────────────────────
+// Approving stamps the reviewer's name and the review date, which is what the
+// public card and its FAQPage markup display.
+router.post('/knowledge/bulk', requireAdmin, validateBody(knowledgeBulkSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { ids, action, reason } = req.body
+    const now = new Date().toISOString()
+    const user = (req as any).user
+
+    const update = action === 'approve'
+      ? {
+          is_published: true,
+          published_at: now,
+          reviewed_by: reviewerName(user),
+          last_reviewed_at: now,
+          rejected_reason: null,
+          updated_at: now,
+        }
+      : {
+          is_published: false,
+          rejected_reason: reason ?? 'Not suitable for publication',
+          reviewed_by: reviewerName(user),
+          last_reviewed_at: now,
+          updated_at: now,
+        }
+
+    const { data, error } = await supabase
+      .from('knowledge_cards')
+      .update(update)
+      .in('id', ids)
+      .select('id')
+    if (error) throw error
+
+    const changed = (data ?? []).map(r => r.id)
+
+    await writeAudit(req, {
+      action: action === 'approve' ? 'PUBLISH_KNOWLEDGE' : 'REJECT_KNOWLEDGE',
+      entityType: 'knowledge_card', entityId: null,
+      before: { requested: ids.length },
+      after: { changed: changed.length, reason: reason ?? null },
+    })
+
+    res.json({ changed: changed.length, skipped: ids.length - changed.length })
   } catch (err) {
     next(err)
   }

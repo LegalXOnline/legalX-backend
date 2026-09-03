@@ -204,6 +204,27 @@ export const shortsBulkSchema = z.object({
   reason: z.string().max(500).trim().optional(),
 })
 
+/**
+ * Know Your Rights review queue.
+ *
+ * The batch cap is higher than the shorts equivalent: this is a one-off
+ * backlog of 182 imported explainers rather than a daily trickle, and an
+ * editor working through a category wants to clear it in a few passes.
+ */
+export const knowledgeBulkSchema = z.object({
+  ids: z.array(z.string().uuid()).min(1, 'Select at least one').max(200),
+  action: z.enum(['approve', 'reject']),
+  reason: z.string().max(500).trim().optional(),
+})
+
+export const knowledgeListQuerySchema = z.object({
+  status: z.enum(['pending', 'published', 'rejected', 'all']).default('pending'),
+  category: z.string().max(60).trim().optional(),
+  search: z.string().max(120).trim().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+})
+
 export const shortsUpdateSchema = z.object({
   title: z.string().min(3).max(255).trim().optional(),
   summary: z.string().min(10).max(5000).trim().optional(),
