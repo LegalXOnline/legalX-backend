@@ -32,13 +32,37 @@ async function getAuthUser(req: Request): Promise<{ id: string; email: string | 
   }
 }
 
+/**
+ * Avatar tile colours.
+ *
+ * Every lawyer was served the same '#1a3a5c', so a grid of cards was a column
+ * of identical blue squares — and that blue belongs to no part of the site's
+ * palette. These are deep, desaturated tones that sit on the dark card without
+ * competing with the gold, and the index is derived from the account id so a
+ * given lawyer keeps the same colour on every render.
+ */
+const AVATAR_TONES = [
+  '#2B3440', // slate
+  '#3A2E24', // bronze
+  '#23343A', // deep teal
+  '#312A3B', // plum
+  '#2C3628', // olive
+  '#3A2B2B', // oxblood
+]
+
+function avatarTone(seed: string): string {
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  return AVATAR_TONES[hash % AVATAR_TONES.length]
+}
+
 // ── Shared mapper: DB row → public Lawyer card shape ─────────────────────────
 function mapRow(d: any) {
   return {
     slug:            d.account_id,
     name:            `${d.first_name ?? ''} ${d.last_name ?? ''}`.trim(),
     initials:        `${d.first_name?.[0] ?? ''}${d.last_name?.[0] ?? ''}`,
-    avatarBg:        '#1a3a5c',
+    avatarBg:        avatarTone(String(d.account_id ?? d.first_name ?? '')),
     avatarUrl:       d.profile_photo_url ?? null,
     barNumber:       d.bar_council_number ?? '',
     barState:        d.bar_council_state ?? '',
