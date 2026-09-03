@@ -6,6 +6,12 @@ dist
 # Bare Act texts: bulky, and each deployment supplies its own.
 data/acts/*.txt
 
+# Internal schema review: candid critique of the live database, kept local.
+docs
+
 # macOS resource forks — these were being committed.
 ._*
 .DS_Store
+
+# Stray Next.js build output (this is an Express service).
+.next/
