@@ -88,6 +88,51 @@ function isNonStory(title: string): boolean {
 }
 
 /**
+ * Named private individuals.
+ *
+ * SEBI and RBI enforcement notices are titled after the person they are
+ * against — "In the matter of Shri <name>". Summarising those republishes an
+ * individual's name on a consumer feed, which serves no reader and is a real
+ * harm to the person named. There is no legal update in them either: the
+ * general public cannot act on one person's adjudication order.
+ *
+ * Applied to headline and body, before the gate, so a match costs no LLM call.
+ */
+const NAME_PATTERN = /(?:^|\s)(?:Shri|Smt\.?|Mr\.?|Mrs\.?|Ms\.?|Dr\.?|M\/s\.?)\s+[A-Z][a-z]+/
+const MATTER_PATTERN = /in the matter of/i
+
+/**
+ * Honorifics are optional in practice. SEBI titles its orders "General
+ * Remittance Order against Sagarkumar Dataniya" — a named private individual
+ * with no Shri or Mr in front, which the honorific pattern alone lets through.
+ */
+const ENFORCEMENT_AGAINST = /\b(?:against|upon|on)\s+(?:Shri|Smt\.?|Mr\.?|Mrs\.?|Ms\.?|Dr\.?|M\/s\.?\s*)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/
+
+/**
+ * Words that mark the matched phrase as an organisation rather than a person.
+ * An order against a listed company is public-interest news; an order against
+ * an individual retail trader is not, and republishing their name is the harm.
+ */
+const INSTITUTION_WORDS = /\b(?:Bank|Limited|Ltd|Private|Pvt|Corporation|Corp|Company|Board|Authority|Commission|Ministry|Department|Government|Exchange|Securities|Fund|Trust|Services|Industries|Enterprises|Association|Council|Institute|University|Court|Tribunal|Federation|Society|Union|Agency|Bureau|Reserve|India|Insurance|Finance|Financial|Holdings|Capital|Technologies|Solutions|Systems)\b/
+
+/** Enforcement-order titles that are about one named party by construction. */
+const ENFORCEMENT_DOC = /\b(?:remittance order|adjudication order|recovery certificate|attachment order|debarment|show cause notice|penalty (?:on|against))\b/i
+
+export function namesPrivateIndividual(text: string, title?: string): boolean {
+  const haystacks = [title ?? '', text ?? '']
+
+  for (const h of haystacks) {
+    if (!h) continue
+    if (NAME_PATTERN.test(h) || MATTER_PATTERN.test(h)) return true
+    if (ENFORCEMENT_DOC.test(h)) return true
+
+    const m = ENFORCEMENT_AGAINST.exec(h)
+    if (m && !INSTITUTION_WORDS.test(m[1])) return true
+  }
+  return false
+}
+
+/**
  * Pause between documents, sized to whichever provider is primary.
  */
 function pacingMs(): number {
@@ -436,6 +481,16 @@ export async function runIngest(opts: {
       const substance = looksSubstantive(sourceText, item.title)
       if (!substance.ok) {
         report.skipped.push({ title: item.title.slice(0, 90), reason: substance.reason! })
+        continue
+      }
+
+      // Privacy gate. Enforcement notices against a named person must not
+      // become feed cards — see namesPrivateIndividual.
+      if (namesPrivateIndividual(sourceText, item.title)) {
+        report.skipped.push({
+          title: item.title.slice(0, 90),
+          reason: 'Names a private individual — enforcement notices are not published',
+        })
         continue
       }
 
