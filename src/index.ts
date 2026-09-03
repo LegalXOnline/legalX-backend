@@ -20,6 +20,7 @@ import webhooksRouter from './routes/webhooks'
 import notificationsRouter from './routes/notifications'
 import uploadRouter from './routes/upload'
 import shortsRouter from './routes/shorts'
+import knowledgeRouter from './routes/knowledge'
 import jobsRouter from './routes/jobs'
 
 // Extend Express Request type
@@ -225,6 +226,10 @@ app.use('/api/lawyers', lawyersRouter)
 
 // Public legal-shorts feed — read-only, no auth, safe to cache at the edge.
 app.use('/api/shorts', shortsRouter)
+
+// Know Your Rights — published rights explainers. Read-only, no auth; every
+// query filters is_published inline.
+app.use('/api/knowledge', knowledgeRouter)
 
 // Scheduled-job endpoints — secret-authenticated, deliberately outside the
 // CSRF-protected routers (see the note in routes/jobs.ts).
