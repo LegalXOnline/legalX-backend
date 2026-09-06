@@ -687,3 +687,144 @@ export async function sendLawyerRejected(email: string, firstName: string, reaso
     console.error('[email] sendLawyerRejected failed:', err)
   }
 }
+
+// ── Signup OTP verification email ─────────────────────────────────────────────
+export async function sendSignupOtpEmail(email: string, otp: string, firstName: string) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: `${otp} — Verify your LegalX account`,
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <div style="text-align:center;margin-bottom:28px">
+            <h1 style="font-size:28px;font-weight:800;color:#111;letter-spacing:-0.5px;margin:0">
+              Legal<span style="color:#C9A227">X</span>
+            </h1>
+            <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
+          </div>
+
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">Verify your email</h2>
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
+            Hi ${firstName}, enter the code below on the signup page to create your LegalX account.
+          </p>
+
+          <div style="background:#F9F6EF;border:1px solid #E8DCC0;border-radius:10px;padding:24px;text-align:center;margin:0 0 24px">
+            <p style="margin:0 0 10px;color:#7A6010;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px">
+              Verification Code
+            </p>
+            <p style="margin:0;color:#111;font-size:34px;font-weight:800;letter-spacing:9px;font-family:'Courier New',monospace">
+              ${otp}
+            </p>
+          </div>
+
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
+            This code expires in <strong>10 minutes</strong> and can only be used once.
+            Never share it with anyone — LegalX staff will never ask you for it.
+          </p>
+
+          <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE">
+            <p style="color:#888;font-size:12px;line-height:1.6;margin:0">
+              <strong>Didn't request this?</strong> You can safely ignore this email —
+              no account will be created. If you're concerned, contact us at
+              <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>.
+            </p>
+            <p style="color:#aaa;font-size:11px;margin:16px 0 0;text-align:center">
+              LegalXOnline · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222
+            </p>
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendSignupOtpEmail failed:', err)
+  }
+}
+
+// ── Contact form: admin notification ──────────────────────────────────────────
+export async function sendContactFormEmail(opts: {
+  name: string
+  email: string
+  subject: string
+  message: string
+}) {
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `Contact Form: ${opts.subject} — ${opts.name}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 16px;color:#111;border-bottom:2px solid #C9A227;padding-bottom:12px">
+            New Contact Form Submission
+          </h2>
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666;width:120px">Name</td>
+              <td style="padding:10px 0;font-weight:600;color:#111">${opts.name}</td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Email</td>
+              <td style="padding:10px 0;color:#111">
+                <a href="mailto:${opts.email}" style="color:#C9A227">${opts.email}</a>
+              </td>
+            </tr>
+            <tr style="border-bottom:1px solid #EEE">
+              <td style="padding:10px 0;color:#666">Subject</td>
+              <td style="padding:10px 0;font-weight:600;color:#C9A227">${opts.subject}</td>
+            </tr>
+          </table>
+          <div style="margin-top:20px;padding:16px;background:#fafafa;border-left:4px solid #C9A227;border-radius:4px">
+            <p style="margin:0 0 6px;color:#666;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px">
+              Message
+            </p>
+            <p style="margin:0;color:#333;font-size:14px;line-height:1.7;white-space:pre-wrap">${opts.message}</p>
+          </div>
+          <p style="margin:20px 0 0;color:#aaa;font-size:12px">
+            Received at ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendContactFormEmail failed:', err)
+  }
+}
+
+// ── Contact form: confirmation to sender ──────────────────────────────────────
+export async function sendContactFormConfirmation(to: string, name: string) {
+  if (!to) return
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to,
+      subject: 'We received your message — LegalXOnline',
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+          <div style="text-align:center;margin-bottom:24px">
+            <h1 style="font-size:28px;font-weight:800;color:#111;letter-spacing:-0.5px;margin:0">
+              Legal<span style="color:#C9A227">X</span>
+            </h1>
+            <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
+          </div>
+          <h2 style="margin:0 0 12px;color:#111">Thank you, ${name}!</h2>
+          <p style="color:#555;line-height:1.6;font-size:14px">
+            We have received your message and our team will get back to you within
+            <strong>24 hours</strong>.
+          </p>
+          <div style="margin:24px 0;padding:16px;background:#fafafa;border-left:4px solid #C9A227">
+            <p style="margin:0;color:#333;font-size:14px">
+              If you have any urgent questions, email us at
+              <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>
+            </p>
+          </div>
+          <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE;color:#aaa;font-size:11px;text-align:center">
+            LegalXOnline · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendContactFormConfirmation failed:', err)
+  }
+}

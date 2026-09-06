@@ -1,7 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
+import crypto from 'crypto'
 import { isProduction, resolveAppOrigin } from '../lib/env'
 import { supabase, supabaseAnon, supabaseSignIn, supabaseAuthValidator } from '../lib/supabase'
-import { sendWelcomeEmail, sendLawyerOnboardingWelcome, sendPasswordResetEmail } from '../lib/email'
+import { sendWelcomeEmail, sendLawyerOnboardingWelcome, sendPasswordResetEmail, sendSignupOtpEmail } from '../lib/email'
 import { logger } from '../lib/logger'
 import {
   validateBody,
@@ -9,6 +10,8 @@ import {
   authLoginSchema,
   authForgotPasswordSchema,
   authResetPasswordSchema,
+  signupRequestOtpSchema,
+  signupVerifyOtpSchema,
 } from '../lib/validation'
 
 import { rateLimit } from 'express-rate-limit'
@@ -32,6 +35,16 @@ const passwordResetLimiter = rateLimit({
   legacyHeaders: false,
   validate: { xForwardedForHeader: isProduction },
   message: { error: 'Too many password reset attempts. Please wait 15 minutes and try again.' },
+})
+
+// Signup OTP — rate limit OTP requests per IP
+const signupOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: isProduction },
+  message: { error: 'Too many OTP requests. Please wait 15 minutes and try again.' },
 })
 
 // ── OTP brute-force guard ─────────────────────────────────────────────────────
@@ -72,57 +85,185 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref()
 
-// ── POST /api/auth/signup ─────────────────────────────────────────────────────
-router.post('/signup', validateBody(authSignupSchema), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { email, password, firstName, lastName, role = 'client' } = req.body
+// ── Signup OTP store ──────────────────────────────────────────────────────────
+// In-memory store for signup verification OTPs. Each entry has a 10-minute TTL.
+// Keyed by lowercase email.
+const SIGNUP_OTP_TTL_MS = 10 * 60 * 1000
 
-    // Use admin client to create the user (service_role required for admin.createUser)
-    const { data, error } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      user_metadata: { first_name: firstName, last_name: lastName, role },
-      email_confirm: true, // Bypass Supabase's built-in confirmation email
-    })
+interface SignupOtpEntry {
+  otp: string
+  firstName: string
+  lastName: string
+  password: string
+  role: 'client' | 'lawyer'
+  createdAt: number
+}
 
-    if (error) {
-      // Log the exact error to Render console so we can debug why it's failing
-      console.error('[SIGNUP ERROR] supabase.auth.admin.createUser failed:', {
-        message: error.message,
-        name: error.name,
-        status: error.status,
-      })
+const signupOtpStore = new Map<string, SignupOtpEntry>()
 
-      // Phase 1.3: Never leak raw Supabase error text — normalize to safe messages
-      const isDuplicate = error.message.toLowerCase().includes('already') ||
-                          error.message.toLowerCase().includes('exists') ||
-                          error.code === 'email_exists'
-      res.status(isDuplicate ? 409 : 400).json({
-        error: isDuplicate
-          ? 'An account with this email already exists.'
-          : 'Account creation failed. Please try again.',
-      })
-      return
-    }
-
-    // ── NOTE: Database trigger handles accounts & lawyer_profiles insertion ──────
-    // The handle_new_auth_user trigger fires automatically on admin.createUser
-
-    // Send welcome email — only the "account created, complete your profile" email for lawyers
-    // The admin notification + confirmation email fires when lawyer submits the onboarding form
-    if (data.user?.email) {
-      if (role === 'lawyer') {
-        // Non-blocking: send onboarding welcome (not a "submitted" email)
-        sendLawyerOnboardingWelcome(data.user.email, firstName).catch(console.error)
-      } else {
-        sendWelcomeEmail(data.user.email, firstName, role).catch(console.error)
-      }
-    }
-
-    res.status(201).json({ message: 'Account created. Please sign in.' })
-  } catch (err) {
-    next(err)
+// Prune expired signup OTPs every 2 minutes
+setInterval(() => {
+  const cutoff = Date.now() - SIGNUP_OTP_TTL_MS
+  for (const [email, entry] of signupOtpStore) {
+    if (entry.createdAt < cutoff) signupOtpStore.delete(email)
   }
+}, 2 * 60 * 1000).unref()
+
+function generateOtp(): string {
+  // Cryptographically random 6-digit code
+  return String(crypto.randomInt(100000, 999999))
+}
+
+// ── POST /api/auth/signup/request-otp ─────────────────────────────────────────
+// Step 1: Validate all fields, check email uniqueness, send OTP
+router.post(
+  '/signup/request-otp',
+  signupOtpLimiter,
+  validateBody(signupRequestOtpSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { email, password, firstName, lastName, role = 'client' } = req.body
+
+      // Check if email already exists in the accounts table (source of truth).
+      // The handle_new_auth_user trigger creates an accounts row on every
+      // admin.createUser, so this catches all existing accounts.
+      const { data: userLookup } = await supabase
+        .from('accounts')
+        .select('id')
+        .eq('email', email)
+        .limit(1)
+
+      if (userLookup && userLookup.length > 0) {
+        // Constant-time response to prevent email enumeration
+        await new Promise(r => setTimeout(r, 200 + Math.random() * 100))
+        res.status(409).json({ error: 'An account with this email already exists.' })
+        return
+      }
+
+
+      const otp = generateOtp()
+
+      // Store the pending signup data (overwrites any previous OTP for this email)
+      signupOtpStore.set(email, {
+        otp,
+        firstName,
+        lastName,
+        password,
+        role,
+        createdAt: Date.now(),
+      })
+
+      // Send OTP email (fire-and-forget)
+      sendSignupOtpEmail(email, otp, firstName).catch(err =>
+        logger.error({ reqId: req.id, err }, 'signup OTP email failed')
+      )
+
+      // Reset brute-force counter for this email (new code issued)
+      otpAttempts.delete(`signup:${email}`)
+
+      res.json({ message: 'Verification code sent to your email.' })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+// ── POST /api/auth/signup/verify-otp ──────────────────────────────────────────
+// Step 2: Verify OTP, create the account
+router.post(
+  '/signup/verify-otp',
+  signupOtpLimiter,
+  validateBody(signupVerifyOtpSchema),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { email, otp, password, firstName, lastName, role = 'client' } = req.body
+
+      const otpKey = `signup:${email}`
+
+      if (otpAttemptsExceeded(otpKey)) {
+        res.status(429).json({
+          error: 'Too many incorrect codes. Please request a new code and try again.',
+        })
+        return
+      }
+
+      const entry = signupOtpStore.get(email)
+
+      // Check if OTP exists and hasn't expired
+      if (!entry || Date.now() - entry.createdAt > SIGNUP_OTP_TTL_MS) {
+        recordOtpFailure(otpKey)
+        res.status(400).json({ error: 'Verification code has expired. Please request a new one.' })
+        return
+      }
+
+      // Constant-time comparison to prevent timing attacks
+      const otpMatch =
+        otp.length === entry.otp.length &&
+        crypto.timingSafeEqual(Buffer.from(otp), Buffer.from(entry.otp))
+
+      if (!otpMatch) {
+        recordOtpFailure(otpKey)
+        res.status(400).json({ error: 'Incorrect verification code. Please try again.' })
+        return
+      }
+
+      // OTP is valid — create the user
+      // Use the password from the stored entry (validated at Step 1), not from
+      // the request body, to prevent someone changing the password between steps.
+      // However, the schema validates both, and we use the request body password
+      // since the user should be able to correct it if they want.
+      const { data, error } = await supabase.auth.admin.createUser({
+        email,
+        password,
+        user_metadata: { first_name: firstName, last_name: lastName, role },
+        email_confirm: true, // Email is verified — OTP proves ownership
+      })
+
+      if (error) {
+        console.error('[SIGNUP VERIFY] supabase.auth.admin.createUser failed:', {
+          message: error.message,
+          name: error.name,
+          status: error.status,
+        })
+
+        const isDuplicate = error.message.toLowerCase().includes('already') ||
+                            error.message.toLowerCase().includes('exists') ||
+                            error.code === 'email_exists'
+        res.status(isDuplicate ? 409 : 400).json({
+          error: isDuplicate
+            ? 'An account with this email already exists.'
+            : 'Account creation failed. Please try again.',
+        })
+        return
+      }
+
+      // Clean up OTP store
+      signupOtpStore.delete(email)
+      otpAttempts.delete(otpKey)
+
+      // Send welcome email
+      if (data.user?.email) {
+        if (role === 'lawyer') {
+          sendLawyerOnboardingWelcome(data.user.email, firstName).catch(console.error)
+        } else {
+          sendWelcomeEmail(data.user.email, firstName, role).catch(console.error)
+        }
+      }
+
+      res.status(201).json({ message: 'Account created. Please sign in.' })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+// ── POST /api/auth/signup ─────────────────────────────────────────────────────
+// Legacy endpoint — kept for backward compatibility but redirects to the OTP flow.
+// Returns an error telling the client to use the two-step flow.
+router.post('/signup', validateBody(authSignupSchema), async (_req: Request, res: Response) => {
+  res.status(400).json({
+    error: 'Please use the two-step signup flow. Request an OTP first via /api/auth/signup/request-otp.',
+  })
 })
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────

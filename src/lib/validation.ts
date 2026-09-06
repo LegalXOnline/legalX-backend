@@ -58,8 +58,45 @@ const strongPasswordSchema = z
   .regex(/[A-Z]/, 'Password must contain an uppercase letter')
   .regex(/[0-9]/, 'Password must contain a number')
 
+/**
+ * Strict email validation — rejects bare strings like "123", "abc", or "no@domain".
+ * Requires a proper user@domain.tld structure with a TLD of 2+ characters.
+ * Zod's .email() covers the RFC basics; the regex tightens it against typo-domains.
+ */
+const strictEmailSchema = z
+  .string()
+  .email('Enter a valid email address')
+  .max(255)
+  .trim()
+  .toLowerCase()
+  .refine(
+    (val) => /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/.test(val),
+    { message: 'Enter a valid email address (e.g. you@gmail.com)' }
+  )
+
 export const authSignupSchema = z.object({
-  email: z.string().email().max(255).trim().toLowerCase(),
+  email: strictEmailSchema,
+  password: strongPasswordSchema,
+  firstName: z.string().min(1).max(50).trim(),
+  lastName: z.string().min(1).max(50).trim(),
+  role: z.enum(['client', 'lawyer']).default('client'),
+})
+
+/**
+ * Step 1 of signup: request an OTP. Validates all fields up front so the user
+ */
+export const signupRequestOtpSchema = z.object({
+  email: strictEmailSchema,
+  password: strongPasswordSchema,
+  firstName: z.string().min(1).max(50).trim(),
+  lastName: z.string().min(1).max(50).trim(),
+  role: z.enum(['client', 'lawyer']).default('client'),
+})
+
+/** Step 2 of signup: verify the OTP and create the account. */
+export const signupVerifyOtpSchema = z.object({
+  email: strictEmailSchema,
+  otp: z.string().trim().regex(/^\d{6}$/, 'Enter the 6-digit code from your email'),
   password: strongPasswordSchema,
   firstName: z.string().min(1).max(50).trim(),
   lastName: z.string().min(1).max(50).trim(),
@@ -87,6 +124,15 @@ export const authResetPasswordSchema = z.object({
   // cannot silently break resets.
   otp: z.string().trim().regex(/^\d{6,10}$/, 'Enter the code from your email'),
   password: strongPasswordSchema,
+})
+
+// ── Contact form ──────────────────────────────────────────────────────────────
+
+export const contactFormSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(100).trim(),
+  email: strictEmailSchema,
+  subject: z.string().min(1, 'Subject is required').max(200).trim(),
+  message: z.string().min(10, 'Message must be at least 10 characters').max(2000).trim(),
 })
 
 export const lawyerIdParamSchema = z.object({
