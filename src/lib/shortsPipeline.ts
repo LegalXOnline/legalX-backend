@@ -436,6 +436,11 @@ export async function runIngest(opts: {
   logger.info({ candidates: candidates.length, target }, 'ingest: candidates after dedupe')
   opts.onProgress?.(0, Math.min(candidates.length, target))
 
+  // Read once for the whole run. Cards proposed during this run are appended
+  // below, so two reports of the same story arriving in one batch are caught
+  // even though neither was in the library when the run started.
+  const dedupeKeys = await loadDedupeKeys()
+
   let processed = 0
   let index = 0
   let cooldowns = 0
@@ -513,26 +518,15 @@ export async function runIngest(opts: {
 
       // Near-duplicate check on the normalised headline. Two VRRR notices a
       // day apart are different URLs and the same card, so source_url alone
-      // cannot catch them.
-      const key = dedupeKey(item.title)
-      if (key.length > 12) {
-        // Compare against recent keys by token overlap, not equality — the
-        // same story rarely arrives with an identical headline.
-        const { data: recent } = await supabase
-          .from('shorts_cards')
-          .select('dedupe_key')
-          .not('dedupe_key', 'is', null)
-          .order('created_at', { ascending: false })
-          .limit(300)
-
-        const twin = (recent ?? []).find(r => isNearDuplicate(key, String(r.dedupe_key)))
-        if (twin) {
-          report.skipped.push({
-            title: item.title.slice(0, 90),
-            reason: 'Near-duplicate of an existing card.',
-          })
-          continue
-        }
+      // cannot catch them. Compared by token overlap rather than equality —
+      // the same story rarely arrives with an identical headline.
+      const twin = findTwin(item.title, dedupeKeys)
+      if (twin) {
+        report.skipped.push({
+          title: item.title.slice(0, 90),
+          reason: 'Near-duplicate of an existing card.',
+        })
+        continue
       }
 
       // ── Stage 2: card generator ──────────────────────────────────────────
@@ -571,6 +565,10 @@ export async function runIngest(opts: {
 
       const inserted = await insertSuggestion(item, result, sourceText, verdict, check)
       if (inserted) {
+        // Keep the in-memory list current: the same story often appears twice
+        // in one pull under slightly different headlines, and the second copy
+        // must be measured against the first.
+        dedupeKeys.push(dedupeKey(item.title))
         report.suggestions.push(inserted)
         report.proposed += 1
       }
@@ -644,6 +642,43 @@ export async function runIngest(opts: {
 }
 
 /**
+ * Normalised headlines of every card already in the library.
+ *
+ * Read once per run rather than once per candidate. The check used to re-query
+ * the 300 most recent rows for every item, which is a query per item and — more
+ * importantly — a window that quietly stops covering the corpus the moment it
+ * passes 300 cards, which is exactly when duplicates start to matter.
+ */
+async function loadDedupeKeys(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('shorts_cards')
+    .select('dedupe_key')
+    .not('dedupe_key', 'is', null)
+    .limit(5000)
+
+  if (error) {
+    // Failing open would let a duplicate through silently. The caller decides
+    // what to do; an empty list means "no comparison was possible".
+    logger.warn({ err: error.message }, 'dedupe: could not read existing keys')
+    return []
+  }
+  return (data ?? []).map(r => String(r.dedupe_key))
+}
+
+/**
+ * The existing headline this one duplicates, if any.
+ *
+ * Very short keys are not compared: after dates, amounts and stop words are
+ * stripped, a two-word remainder overlaps with far too much to be evidence of
+ * anything.
+ */
+function findTwin(title: string, keys: string[]): string | null {
+  const key = dedupeKey(title)
+  if (key.length <= 12) return null
+  return keys.find(k => isNearDuplicate(key, k)) ?? null
+}
+
+/**
  * One-off draft from an operator-supplied source: a URL to fetch, or text
  * pasted directly. Used for anything the feeds miss.
  */
@@ -668,6 +703,16 @@ export async function draftFromSource(input: {
 
   const result = await summariseSource(sourceText, { sourceName: input.sourceName })
   if ('skipped' in result) return { skipped: true, reason: result.reason }
+
+  // The source_url check above only catches the same link twice. The same
+  // story pasted from a mirror — a PIB release and the ministry's own page —
+  // is a different URL and the same card, so the headline is checked too.
+  // This runs after the summary because a pasted document has no title until
+  // the generator produces one.
+  const twin = findTwin(result.title, await loadDedupeKeys())
+  if (twin) {
+    return { skipped: true, reason: 'Near-duplicate of a card already in the library.' }
+  }
 
   const item: FeedItem = {
     title: result.title,
