@@ -28,6 +28,8 @@ import {
   shortsAutoIngestSchema,
   knowledgeBulkSchema,
   knowledgeListQuerySchema,
+  adminAccountListQuerySchema,
+  adminAccountDeleteSchema,
 } from '../lib/validation'
 import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
 import { createNotification } from '../lib/notify'
@@ -1650,6 +1652,298 @@ router.post('/knowledge/bulk', requireAdmin, validateBody(knowledgeBulkSchema), 
     })
 
     res.json({ changed: changed.length, skipped: ids.length - changed.length })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── Accounts ─────────────────────────────────────────────────────────────────
+/**
+ * One list, every account.
+ *
+ * Clients and lawyers each have their own page for day-to-day work, but a
+ * deletion needs to start from a single place that does not care which of the
+ * two an address belongs to — an admin cleaning up a stale signup should not
+ * have to know in advance whether it became a lawyer profile.
+ */
+router.get('/accounts', requireAdmin, validateQuery(adminAccountListQuerySchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { role, search, page, pageSize } = req.validatedQuery as {
+      role: 'all' | 'client' | 'lawyer' | 'admin'
+      search?: string
+      page: number
+      pageSize: number
+    }
+    const [from, to] = pageRange(page, pageSize)
+
+    let query = supabase
+      .from('accounts')
+      .select('id, email, phone, first_name, last_name, role, status, created_at, last_login_at', { count: 'exact' })
+
+    if (role !== 'all') query = query.eq('role', role)
+
+    if (search) {
+      const term = escapeLike(search)
+      if (term) {
+        query = query.or(`first_name.ilike.%${term}%,last_name.ilike.%${term}%,email.ilike.%${term}%`)
+      }
+    }
+
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(from, to)
+    if (error) throw error
+
+    const accounts = data ?? []
+
+    // Verification status only exists for lawyers, and is the one thing an
+    // admin needs to see on this row before deciding to remove the account.
+    const lawyerIds = accounts.filter(a => a.role === 'lawyer').map(a => a.id)
+    const verification = new Map<string, string>()
+    if (lawyerIds.length) {
+      const { data: profiles } = await supabase
+        .from('lawyer_profiles')
+        .select('account_id, verification_status')
+        .in('account_id', lawyerIds)
+      for (const p of profiles ?? []) verification.set(p.account_id, p.verification_status)
+    }
+
+    res.json({
+      accounts: accounts.map(a => ({
+        ...a,
+        verification_status: verification.get(a.id) ?? null,
+      })),
+      total: count ?? 0,
+      page,
+      pageSize,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * Account rows whose Supabase Auth user is already gone.
+ *
+ * These are the leftovers from deleting a user in the Auth dashboard before
+ * the cascades existed: the login is gone, but the profile, bookings and
+ * wallet are all still here. They are invisible everywhere else in the portal
+ * because they still look like ordinary accounts.
+ */
+router.get('/accounts/orphans', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // An account is called an orphan because it is absent from this set, so a
+    // truncated set would label live accounts as orphans — and the next click
+    // deletes them. If either list is short of complete, report nothing and say
+    // so, rather than handing the admin a plausible-looking wrong answer.
+    const MAX_PAGES = 5
+    const PER_PAGE = 1000
+    const authIds = new Set<string>()
+    let complete = true
+
+    for (let p = 1; p <= MAX_PAGES; p++) {
+      const { data, error } = await supabase.auth.admin.listUsers({ page: p, perPage: PER_PAGE })
+      if (error) throw error
+      for (const u of data.users) authIds.add(u.id)
+      if (data.users.length < PER_PAGE) break
+      if (p === MAX_PAGES) complete = false
+    }
+
+    const ACCOUNT_LIMIT = MAX_PAGES * PER_PAGE
+    const { data: accounts, error } = await supabase
+      .from('accounts')
+      .select('id, email, phone, first_name, last_name, role, status, created_at, last_login_at')
+      .order('created_at', { ascending: false })
+      .limit(ACCOUNT_LIMIT)
+    if (error) throw error
+
+    if ((accounts?.length ?? 0) >= ACCOUNT_LIMIT) complete = false
+
+    if (!complete) {
+      logger.warn({ reqId: req.id }, 'orphan scan truncated — refusing to report a partial list')
+      return res.json({ orphans: [], complete: false })
+    }
+
+    const orphans = (accounts ?? []).filter(a => !authIds.has(a.id))
+
+    return res.json({ orphans, complete: true })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * What disappears if this account is deleted.
+ *
+ * Counts come from admin_account_impact(), which discovers the referencing
+ * tables from the live foreign keys rather than a list kept in this file. If
+ * the function is missing — the migration has not been applied yet — the
+ * endpoint still answers, with an empty breakdown and a note, so the portal
+ * degrades to "we cannot show you the detail" instead of failing.
+ */
+router.get('/accounts/:id/impact', requireAdmin, validateParams(accountIdParamSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+
+    const { data: account, error } = await supabase
+      .from('accounts')
+      .select('id, email, phone, first_name, last_name, role, status, created_at, last_login_at')
+      .eq('id', id)
+      .maybeSingle()
+    if (error) throw error
+
+    const { data: authUser } = await supabase.auth.admin.getUserById(id)
+
+    if (!account && !authUser?.user) {
+      return res.status(404).json({ error: 'No such account' })
+    }
+
+    let tables: Record<string, number> = {}
+    let impactAvailable = true
+    const { data: impact, error: rpcError } = await supabase.rpc('admin_account_impact', {
+      p_account_id: id,
+    })
+    if (rpcError) {
+      impactAvailable = false
+      logger.warn({ reqId: req.id, err: rpcError.message }, 'admin_account_impact unavailable')
+    } else {
+      tables = (impact as { tables?: Record<string, number> } | null)?.tables ?? {}
+    }
+
+    return res.json({
+      account: account ?? null,
+      authUserExists: !!authUser?.user,
+      authEmail: authUser?.user?.email ?? null,
+      impactAvailable,
+      tables,
+      totalRows: Object.values(tables).reduce((sum, n) => sum + Number(n), 0),
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * DELETE /api/admin/accounts/:id — remove an account and everything behind it.
+ *
+ * The whole point of this endpoint is that it is the only thing an admin has to
+ * call. Deleting the Auth user cascades through accounts into the profile,
+ * documents, wallet, bookings, messages and the rest; rows that outlive the
+ * person — audit entries, a reviewed card — keep their history and lose only
+ * the pointer. Both halves of that behaviour come from the foreign keys, not
+ * from a delete order written out here, which is what stops it drifting as
+ * tables are added.
+ *
+ * Guards, in order: not yourself, not the last admin, and the account's own
+ * email retyped. The tombstone is written first, so a failure part-way through
+ * still leaves a record that the deletion was attempted and by whom.
+ */
+router.delete('/accounts/:id', requireAdmin, validateParams(accountIdParamSchema), validateBody(adminAccountDeleteSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { confirmEmail, reason } = req.body as { confirmEmail: string; reason: string }
+    const admin = (req as any).user as { id: string; email?: string }
+
+    if (id === admin.id) {
+      return res.status(400).json({ error: 'You cannot delete the account you are signed in with.' })
+    }
+
+    const { data: account } = await supabase
+      .from('accounts')
+      .select('id, email, phone, first_name, last_name, role, status, created_at, last_login_at')
+      .eq('id', id)
+      .maybeSingle()
+
+    const { data: authUser } = await supabase.auth.admin.getUserById(id)
+
+    if (!account && !authUser?.user) {
+      return res.status(404).json({ error: 'No such account' })
+    }
+
+    // The typed confirmation is checked against whichever record survives, so
+    // an orphaned row with no Auth user can still be confirmed and purged.
+    const realEmail = (account?.email ?? authUser?.user?.email ?? '').trim().toLowerCase()
+    if (!realEmail || confirmEmail !== realEmail) {
+      return res.status(400).json({
+        error: 'The email you typed does not match this account. Deletion cancelled.',
+      })
+    }
+
+    if (account?.role === 'admin') {
+      const { count } = await supabase
+        .from('accounts')
+        .select('id', { count: 'exact', head: true })
+        .eq('role', 'admin')
+      if ((count ?? 0) <= 1) {
+        return res.status(400).json({ error: 'This is the last admin account — it cannot be deleted.' })
+      }
+    }
+
+    // Snapshot before anything is removed. Best-effort: a missing RPC must not
+    // block the deletion the admin came here to perform.
+    const { data: impact } = await supabase.rpc('admin_account_impact', { p_account_id: id })
+    const tables = (impact as { tables?: Record<string, number> } | null)?.tables ?? {}
+
+    const { error: tombError } = await supabase.from('deleted_accounts').upsert({
+      id,
+      email: realEmail,
+      phone: account?.phone ?? null,
+      first_name: account?.first_name ?? null,
+      last_name: account?.last_name ?? null,
+      role: account?.role ?? null,
+      status: account?.status ?? null,
+      account_created_at: account?.created_at ?? null,
+      snapshot: account ?? {},
+      impact: tables,
+      reason,
+      deleted_by: admin.id,
+      deleted_by_email: admin.email ?? null,
+      deleted_at: new Date().toISOString(),
+    })
+    if (tombError) {
+      // Without the tombstone there is no record of the deletion, and an
+      // untraceable purge is worse than a failed one.
+      logger.error({ reqId: req.id, err: tombError.message }, 'deleted_accounts write failed')
+      // 424 rather than 500: the client maps 5xx to a generic "server error",
+      // and this particular failure has a specific fix the admin needs to read.
+      return res.status(424).json({
+        error: 'Could not record the deletion, so nothing was removed. Apply the account-deletion migration and try again.',
+      })
+    }
+
+    // Removing the Auth user cascades into accounts and everything below it.
+    if (authUser?.user) {
+      const { error: authError } = await supabase.auth.admin.deleteUser(id)
+      if (authError) {
+        logger.error({ reqId: req.id, err: authError.message }, 'auth deleteUser failed')
+        return res.status(500).json({ error: 'Could not delete the login. Nothing else was removed.' })
+      }
+    }
+
+    // Belt and braces: the cascade from auth.users only fires if that foreign
+    // key exists, and orphans have no Auth user to cascade from at all.
+    const { error: rowError } = await supabase.from('accounts').delete().eq('id', id)
+    if (rowError) {
+      logger.error({ reqId: req.id, err: rowError.message }, 'accounts row delete failed')
+      return res.status(424).json({
+        error: 'The login was removed but related records could not be. Apply the account-deletion migration, then delete again to finish the cleanup.',
+      })
+    }
+
+    await writeAudit(req, {
+      action: 'DELETE_ACCOUNT',
+      entityType: 'account',
+      entityId: id,
+      before: { email: realEmail, role: account?.role ?? null, tables },
+      after: { reason },
+    })
+
+    return res.json({
+      deleted: true,
+      email: realEmail,
+      rowsRemoved: Object.values(tables).reduce((sum, n) => sum + Number(n), 0),
+      tables,
+    })
   } catch (err) {
     next(err)
   }

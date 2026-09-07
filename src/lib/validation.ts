@@ -192,6 +192,26 @@ export const accountIdParamSchema = z.object({
   id: z.string().uuid(),
 })
 
+// ── Account deletion (admin portal) ───────────────────────────────────────────
+
+/** One list covering every account, whatever its role. */
+export const adminAccountListQuerySchema = z.object({
+  role: z.enum(['all', 'client', 'lawyer', 'admin']).default('all'),
+  search: z.string().max(120).trim().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+})
+
+/**
+ * Deleting an account is irreversible and unwinds rows across a dozen tables,
+ * so it takes more than a click: the admin retypes the account's email address
+ * and states a reason, both of which are stored on the tombstone.
+ */
+export const adminAccountDeleteSchema = z.object({
+  confirmEmail: z.string().max(255).trim().toLowerCase(),
+  reason: z.string().min(5).max(500).trim(),
+})
+
 export const adminDisputeUpdateSchema = z.object({
   status: z.enum(['open', 'investigating', 'resolved', 'escalated']),
   resolutionNote: z.string().max(2000).trim().optional(),
