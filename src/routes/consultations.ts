@@ -350,6 +350,66 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
   }
 })
 
+// ── GET /api/consultations/incoming ──────────────────────────────────────────
+/**
+ * The call ringing for this lawyer right now, if any.
+ *
+ * A fallback for the Server-Sent Events stream, which has proved fragile in
+ * ways that are invisible from the browser: a rewrite that buffers the body, an
+ * ad blocker, a proxy that closes idle connections. In every one of those the
+ * connection looks healthy and simply never delivers, and a lawyer marked
+ * Available silently misses every call.
+ *
+ * Polling this is unglamorous and cannot fail the same way. SSE stays as the
+ * fast path; this is what makes the feature work when it does not arrive.
+ *
+ * Only unexpired rings, and only ones addressed to the caller.
+ */
+router.get('/incoming', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+    if (user.role !== 'lawyer') { res.json({ call: null }); return }
+
+    const { data, error } = await supabase
+      .from('consultation_notifications')
+      .select('consultation_id, client_id, type, expires_at')
+      .eq('lawyer_id', user.id)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (error) throw error
+    if (!data) { res.json({ call: null }); return }
+
+    // The ring row outlives the consultation's pending state — a caller who
+    // hung up leaves the row behind for its full twenty seconds. Ringing for a
+    // call nobody is waiting on is worse than not ringing at all.
+    const { data: consultation } = await supabase
+      .from('consultations')
+      .select('status')
+      .eq('id', data.consultation_id)
+      .maybeSingle()
+
+    if (!consultation || consultation.status !== 'pending') {
+      res.json({ call: null }); return
+    }
+
+    res.json({
+      call: {
+        consultationId: data.consultation_id,
+        clientId: data.client_id,
+        type: data.type,
+        expiresAt: data.expires_at,
+      },
+    })
+  } catch (err) {
+    console.error('[consultations/incoming]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // ── PATCH /api/consultations/:id/accept ──────────────────────────────────────
 // Phase 3.3: Lawyer accepts → gets their room token, marks started_at.
 router.patch('/:id/accept', async (req: Request, res: Response) => {
