@@ -187,6 +187,14 @@ export const pushUnsubscribeSchema = z.object({
   endpoint: z.string().url().max(1000),
 })
 
+/**
+ * One chat message. Trimmed and bounded — a consultation transcript is a legal
+ * record, so an unbounded field would be a liability as well as a footgun.
+ */
+export const messageSendSchema = z.object({
+  content: z.string().min(1, 'Type a message first').max(4000).trim(),
+})
+
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),
 })

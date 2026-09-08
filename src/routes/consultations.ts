@@ -3,7 +3,7 @@ import Razorpay from 'razorpay'
 import { RtcTokenBuilder, RtcRole } from 'agora-token'
 import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
-import { validateBody } from '../lib/validation'
+import { validateBody, messageSendSchema } from '../lib/validation'
 import { createNotification } from '../lib/notify'
 import { logger } from '../lib/logger'
 import { sendPushToAccount } from '../lib/push'
@@ -655,6 +655,161 @@ router.post('/:id/end', async (req: Request, res: Response) => {
     res.json({ ok: true, answered: true, durationSeconds, totalAmount, creditsChargedPaise })
   } catch (err) {
     console.error('[consultations/end]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+
+/**
+ * The conversation for a consultation, created on first use.
+ *
+ * Lazily rather than at accept time: whoever opens the room first creates it,
+ * which means a conversation only exists once somebody actually looked, and
+ * there is no ordering to get wrong between the two participants arriving.
+ *
+ * Returns null when the caller is not a participant — the check belongs here,
+ * once, rather than in each route that reads or writes messages.
+ */
+async function conversationFor(consultationId: string, userId: string) {
+  const { data: consultation } = await supabase
+    .from('consultations')
+    .select('id, client_id, lawyer_id, status')
+    .eq('id', consultationId)
+    .maybeSingle()
+
+  if (!consultation) return { error: 'not_found' as const }
+  if (consultation.client_id !== userId && consultation.lawyer_id !== userId) {
+    return { error: 'forbidden' as const }
+  }
+
+  const { data: existing } = await supabase
+    .from('conversations')
+    .select('id')
+    .eq('consultation_id', consultationId)
+    .maybeSingle()
+
+  if (existing) return { conversationId: existing.id, consultation }
+
+  const { data: created, error: createErr } = await supabase
+    .from('conversations')
+    .insert({ type: 'consultation', consultation_id: consultationId })
+    .select('id')
+    .single()
+
+  if (createErr || !created) {
+    // Two participants opening the room at once both insert; the unique index
+    // on consultation_id lets exactly one win. The loser reads the winner's row
+    // rather than failing, which is the whole point of the index.
+    const { data: raced } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('consultation_id', consultationId)
+      .maybeSingle()
+    if (raced) return { conversationId: raced.id, consultation }
+
+    logger.error({ err: createErr?.message, consultationId }, '[chat] could not open conversation')
+    return { error: 'failed' as const }
+  }
+
+  await supabase.from('conversation_participants').insert([
+    { conversation_id: created.id, account_id: consultation.client_id },
+    { conversation_id: created.id, account_id: consultation.lawyer_id },
+  ])
+
+  return { conversationId: created.id, consultation }
+}
+
+// ── GET /api/consultations/:id/messages ──────────────────────────────────────
+/** Full history, oldest first — a transcript is read in the order it happened. */
+router.get('/:id/messages', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const found = await conversationFor(String(req.params.id), user.id)
+    if ('error' in found) {
+      const status = found.error === 'not_found' ? 404 : found.error === 'forbidden' ? 403 : 500
+      res.status(status).json({ error: found.error === 'forbidden' ? 'Not your consultation' : 'Conversation unavailable' })
+      return
+    }
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('id, sender_id, content, created_at')
+      .eq('conversation_id', found.conversationId)
+      .order('created_at', { ascending: true })
+      .limit(500)
+
+    if (error) throw error
+
+    res.json({
+      conversationId: found.conversationId,
+      messages: data ?? [],
+      selfId: user.id,
+    })
+  } catch (err) {
+    console.error('[consultations/messages GET]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── POST /api/consultations/:id/messages ─────────────────────────────────────
+/**
+ * Persist first, deliver second.
+ *
+ * The row is the record; realtime delivery is a consequence of it. Written this
+ * way round, a message survives a reload, a dropped connection and a browser
+ * closing mid-sentence — none of which is true of anything that only ever
+ * existed in transit.
+ */
+router.post('/:id/messages', validateBody(messageSendSchema), async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const consultationId = String(req.params.id)
+    const found = await conversationFor(consultationId, user.id)
+    if ('error' in found) {
+      const status = found.error === 'not_found' ? 404 : found.error === 'forbidden' ? 403 : 500
+      res.status(status).json({ error: found.error === 'forbidden' ? 'Not your consultation' : 'Conversation unavailable' })
+      return
+    }
+
+    if (found.consultation.status === 'completed' || found.consultation.status === 'cancelled') {
+      res.status(409).json({ error: 'This consultation has ended.' })
+      return
+    }
+
+    const { content } = req.body as { content: string }
+
+    const { data: message, error } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: found.conversationId,
+        sender_id: user.id,
+        content,
+      })
+      .select('id, sender_id, content, created_at')
+      .single()
+
+    if (error) throw error
+
+    // Tell the other side, for the case where they are not looking at the room.
+    const other = found.consultation.client_id === user.id
+      ? found.consultation.lawyer_id
+      : found.consultation.client_id
+
+    void sendPushToAccount(other, {
+      title: 'New message',
+      body: content.slice(0, 120),
+      url: `/consultation/${consultationId}`,
+      tag: `chat-${consultationId}`,
+    }).catch(() => { /* the message is saved either way */ })
+
+    res.status(201).json({ message })
+  } catch (err) {
+    console.error('[consultations/messages POST]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })
