@@ -217,11 +217,20 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
     // Out of credit, so this needs a gateway. Razorpay is off while the
     // PhonePe integration is built: creating a pre-authorisation we have no
     // intention of capturing would put a real hold on a real card.
+    //
+    // 402, not 503: the client maps 5xx to "Service temporarily unavailable",
+    // which told the caller their connection had failed when in fact their free
+    // credit had simply run out — two very different things, and only one of
+    // them is worth retrying.
     if (RAZORPAY_MAINTENANCE) {
-      res.status(503).json({
-        error: 'Paid consultations are on hold while we switch payment providers. Your free consultation credit still works.',
-        code: 'PAYMENTS_MAINTENANCE',
+      const rupees = (creditPaise / 100).toFixed(2).replace(/\.00$/, '')
+      res.status(402).json({
+        error: creditPaise > 0
+          ? `Your free credit is down to ₹${rupees}, which is less than one minute at ₹${feePerMinute}/min. Paid consultations are on hold while we switch payment providers.`
+          : 'Your free consultation credit is used up. Paid consultations are on hold while we switch payment providers.',
+        code: 'OUT_OF_CREDIT',
         creditBalancePaise: creditPaise,
+        feePerMinute,
       })
       return
     }

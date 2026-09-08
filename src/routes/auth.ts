@@ -477,7 +477,7 @@ router.get('/me', async (req: Request, res: Response) => {
     // Read role from accounts table — single source of truth
     const { data: account } = await supabase
       .from('accounts')
-      .select('role, first_name, last_name, status')
+      .select('role, first_name, last_name, status, free_credit_paise')
       .eq('id', u.id)
       .single()
 
@@ -498,6 +498,9 @@ router.get('/me', async (req: Request, res: Response) => {
         firstName: account.first_name ?? u.user_metadata?.first_name ?? '',
         lastName:  account.last_name  ?? u.user_metadata?.last_name  ?? '',
         role:      account.role,
+        // Carried here so the booking widget can show what is actually left
+        // rather than the flat "₹100 to start" it used to print regardless.
+        freeCreditPaise: Number(account.free_credit_paise ?? 0),
       },
     })
   } catch {
