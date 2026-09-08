@@ -331,13 +331,41 @@ router.post('/agora', async (req: Request, res: Response) => {
       : 0
 
     // ── Compute exact capture amount ──────────────────────────────────────────
+    // started_at is stamped when the lawyer accepts, so a null means nobody ever
+    // answered: the client sat alone in the channel and left. That is a missed
+    // call, not a one-minute consultation, and it costs nothing.
+    //
+    // The minimum-minute floor below would otherwise bill it in full. That was
+    // harmless while the only settlement path was a Razorpay capture that never
+    // ran without a payment id, but free credit debits directly — an unanswered
+    // call would have quietly taken a minute's credit off the client.
+    const answered = startedAt !== null
     const feePerMinute = Number(consultation.fee_per_minute)
     const durationMinutes = durationSeconds / 60
-    const totalAmount = Math.max(
-      Math.ceil(durationMinutes * feePerMinute),
-      feePerMinute, // minimum 1 minute charge
-    )
+    const totalAmount = answered
+      ? Math.max(
+          Math.ceil(durationMinutes * feePerMinute),
+          feePerMinute, // minimum 1 minute charge, once the call actually began
+        )
+      : 0
     const totalAmountPaise = totalAmount * 100
+
+    if (!answered) {
+      logger.info(
+        { consultationId: consultation.id, channelName },
+        '[webhook/agora] channel closed before the lawyer joined — no charge'
+      )
+      await supabase.from('consultations').update({
+        status: 'cancelled',
+        ended_at: endedAt.toISOString(),
+        duration_seconds: 0,
+        total_amount: 0,
+        credits_charged_paise: consultation.payment_status === 'credits' ? 0 : null,
+      }).eq('id', consultation.id)
+
+      res.json({ received: true, consultationId: consultation.id, answered: false, totalAmount: 0 })
+      return
+    }
 
     // ── Settle from free credit ───────────────────────────────────────────────
     // A credit-funded call never touched a gateway, so there is nothing to
