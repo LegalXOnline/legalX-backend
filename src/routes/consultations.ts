@@ -6,6 +6,7 @@ import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody } from '../lib/validation'
 import { createNotification } from '../lib/notify'
 import { logger } from '../lib/logger'
+import { sendPushToAccount } from '../lib/push'
 import { z } from 'zod'
 
 const router = Router()
@@ -196,6 +197,18 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
         type,
         expires_at: new Date(Date.now() + 20_000).toISOString(),
       })
+
+      // And push it to their devices. The row above only reaches a lawyer with
+      // a tab open; this is what reaches a phone in a pocket. Deliberately not
+      // awaited — a push that is slow, or a device that has gone away, must not
+      // delay the response the caller is waiting on.
+      void sendPushToAccount(lawyerId, {
+        title: `Incoming ${type} consultation`,
+        body: 'A client is calling now. Tap to answer.',
+        url: `/consultation/${consultation.id}`,
+        tag: `call-${consultation.id}`,
+        kind: 'call',
+      }).catch(err => logger.warn({ err }, '[initiate] call push failed'))
 
       res.status(201).json({
         consultationId: consultation.id,

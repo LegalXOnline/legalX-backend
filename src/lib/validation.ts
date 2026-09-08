@@ -169,6 +169,24 @@ export const lawyerSettingsUpdateSchema = z.object({
   bankIfsc: z.string().max(15).trim().nullable().optional(),
 })
 
+/**
+ * What the browser hands back from pushManager.subscribe().
+ *
+ * The endpoint is the address itself — it names the push service and the device
+ * together — so it is checked as a URL rather than an opaque token.
+ */
+export const pushSubscribeSchema = z.object({
+  endpoint: z.string().url().max(1000),
+  keys: z.object({
+    p256dh: z.string().min(1).max(255),
+    auth: z.string().min(1).max(255),
+  }),
+})
+
+export const pushUnsubscribeSchema = z.object({
+  endpoint: z.string().url().max(1000),
+})
+
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),
 })

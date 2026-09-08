@@ -1,7 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { logger } from '../lib/logger'
-import { validateParams, validateQuery, uuidParamSchema, adminListQuerySchema } from '../lib/validation'
+import {
+  validateParams, validateQuery, validateBody,
+  uuidParamSchema, adminListQuerySchema,
+  pushSubscribeSchema, pushUnsubscribeSchema,
+} from '../lib/validation'
+import { vapidPublicKey, pushConfigured } from '../lib/push'
 
 const router = Router()
 
@@ -20,6 +25,71 @@ async function getUser(req: Request) {
 
   return { id: data.user.id, role: account?.role ?? data.user.user_metadata?.role ?? 'client' }
 }
+
+// ── Web push ─────────────────────────────────────────────────────────────────
+
+/**
+ * The VAPID public key the browser needs at subscribe time.
+ *
+ * Public by design — it is pinned into the subscription so that a stolen
+ * endpoint is useless to anyone who cannot sign with the private half.
+ */
+router.get('/push/key', (_req: Request, res: Response) => {
+  const key = vapidPublicKey()
+  if (!key) { res.status(503).json({ error: 'Push notifications are not configured' }); return }
+  res.json({ publicKey: key, enabled: pushConfigured })
+})
+
+/**
+ * Stores one device's subscription.
+ *
+ * Upserted on the endpoint, which is unique across every account: a browser
+ * that was signed in as somebody else must move to the new owner rather than
+ * leave two rows that both look valid. Re-subscribing is also how a browser
+ * rotates its keys, so an existing row is updated rather than rejected.
+ */
+router.post('/push/subscribe', validateBody(pushSubscribeSchema), async (req: Request, res: Response) => {
+  try {
+    const user = await getUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const { endpoint, keys } = req.body as { endpoint: string; keys: { p256dh: string; auth: string } }
+
+    const { error } = await supabase.from('push_subscriptions').upsert({
+      account_id: user.id,
+      endpoint,
+      p256dh: keys.p256dh,
+      auth: keys.auth,
+      user_agent: String(req.headers['user-agent'] ?? '').slice(0, 300),
+      last_used_at: new Date().toISOString(),
+    }, { onConflict: 'endpoint' })
+
+    if (error) throw error
+    res.status(201).json({ ok: true })
+  } catch (err) {
+    logger.error({ err }, '[push/subscribe]')
+    res.status(500).json({ error: 'Could not save the subscription' })
+  }
+})
+
+/** Removes this device. Called when permission is revoked or on sign-out. */
+router.post('/push/unsubscribe', validateBody(pushUnsubscribeSchema), async (req: Request, res: Response) => {
+  try {
+    const user = await getUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    await supabase
+      .from('push_subscriptions')
+      .delete()
+      .eq('endpoint', String((req.body as { endpoint: string }).endpoint))
+      .eq('account_id', user.id)
+
+    res.json({ ok: true })
+  } catch (err) {
+    logger.error({ err }, '[push/unsubscribe]')
+    res.status(500).json({ error: 'Could not remove the subscription' })
+  }
+})
 
 // ── GET /api/notifications/stream ────────────────────────────────────────────
 // Server-Sent Events. The browser connects with EventSource and its cookie;
