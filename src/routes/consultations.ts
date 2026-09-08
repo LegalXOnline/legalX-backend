@@ -480,7 +480,7 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     const consultationId = String(req.params.id)
     const { data: consultation, error } = await supabase
       .from('consultations')
-      .select('id, client_id, lawyer_id, status, type, hms_room_id')
+      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at')
       .eq('id', consultationId)
       .single()
 
@@ -496,6 +496,43 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     if (consultation.status === 'cancelled' || consultation.status === 'completed') {
       res.status(400).json({ error: 'This consultation has ended.' })
       return
+    }
+
+    /**
+     * The lawyer asking for a token IS the lawyer joining.
+     *
+     * started_at was only ever stamped by PATCH /:id/accept, and nothing in the
+     * frontend has ever called it — the ring banner navigates straight to the
+     * room. So started_at stayed null on every consultation, every call was
+     * settled as one nobody answered, and the Completed tab stayed empty while
+     * two people were talking to each other.
+     *
+     * Stamping it here also makes it truer than the button would: the moment
+     * their browser asks for credentials is the moment they are actually
+     * joining, not the moment they clicked.
+     */
+    if (isLawyer && !consultation.started_at) {
+      const startedAt = new Date().toISOString()
+      const { error: startErr } = await supabase
+        .from('consultations')
+        .update({ status: 'in_progress', started_at: startedAt })
+        .eq('id', consultationId)
+
+      if (startErr) {
+        // Not fatal to the call, but it decides what gets billed, so it is
+        // logged loudly rather than swallowed.
+        logger.error({ err: startErr.message, consultationId }, '[agora-token] could not stamp started_at')
+      } else {
+        consultation.started_at = startedAt
+        consultation.status = 'in_progress'
+        await createNotification({
+          accountId: consultation.client_id,
+          title: 'Your lawyer has joined',
+          message: 'The consultation is starting now.',
+          type: 'consultation',
+          link: `/consultation/${consultationId}`,
+        }).catch(() => { /* the client is already in the room */ })
+      }
     }
 
     // The lawyer is the host; the client joins as an audience-capable publisher.
