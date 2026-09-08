@@ -79,13 +79,13 @@ function generateAgoraToken(channelName: string, userId: string, _role: 'client'
 }
 
 /**
- * Razorpay is switched off at the door while PhonePe is built.
+ * A switch for taking paid consultations offline, off by default.
  *
- * Left as an env flag rather than deleted code: the pre-auth flow below is the
- * only capture-and-void implementation in the codebase, and PhonePe has no
- * equivalent primitive. Turning it back on is one variable, not a rebuild.
+ * Kept because a payment provider having a bad afternoon should be one
+ * variable rather than a deploy. Set RAZORPAY_MAINTENANCE=true to stop opening
+ * pre-authorisations; anyone with a balance can still consult.
  */
-const RAZORPAY_MAINTENANCE = process.env.RAZORPAY_MAINTENANCE !== 'false'
+const RAZORPAY_MAINTENANCE = process.env.RAZORPAY_MAINTENANCE === 'true'
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
 const initiateSchema = z.object({
@@ -134,10 +134,17 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
     // Checked before any gateway is touched. A call the client's credit covers
     // needs no payment at all, which is what makes the call flow testable
     // without a live payment switch sitting in the middle of it.
-    const { data: account } = await supabase
-      .from('accounts').select('free_credit_paise').eq('id', user.id).maybeSingle()
+    const [{ data: account }, { data: wallet }] = await Promise.all([
+      supabase.from('accounts').select('free_credit_paise').eq('id', user.id).maybeSingle(),
+      supabase.from('wallets').select('balance').eq('account_id', user.id).maybeSingle(),
+    ])
 
-    const creditPaise = Number(account?.free_credit_paise ?? 0)
+    // Both sources, because settlement spends both — free credit first, then
+    // the wallet. Checking only the grant would refuse a client who had just
+    // topped up.
+    const freePaise = Number(account?.free_credit_paise ?? 0)
+    const walletPaise = Math.round(Number(wallet?.balance ?? 0) * 100)
+    const creditPaise = freePaise + walletPaise
     const perMinutePaise = feePerMinute * 100
     // Credit buys whole minutes only: a call that can't fund its first minute
     // would be cut off before anyone spoke.
@@ -212,7 +219,7 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
 
       res.status(201).json({
         consultationId: consultation.id,
-        fundedBy: 'credits',
+        fundedBy: 'balance',
         channelName: consultation.id,
         agoraAppId: process.env.AGORA_APP_ID!,
         authToken: generateAgoraToken(consultation.id, user.id, 'client'),
@@ -228,9 +235,10 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
     }
 
     // ── Paid ─────────────────────────────────────────────────────────────────
-    // Out of credit, so this needs a gateway. Razorpay is off while the
-    // PhonePe integration is built: creating a pre-authorisation we have no
-    // intention of capturing would put a real hold on a real card.
+    // Not enough balance for a single minute. Topping up the wallet is the
+    // route rather than a per-call charge: it is one payment for many
+    // consultations, and it keeps the gateway out of the path of a ringing
+    // phone.
     //
     // 402, not 503: the client maps 5xx to "Service temporarily unavailable",
     // which told the caller their connection had failed when in fact their free
@@ -240,8 +248,8 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
       const rupees = (creditPaise / 100).toFixed(2).replace(/\.00$/, '')
       res.status(402).json({
         error: creditPaise > 0
-          ? `Your free credit is down to ₹${rupees}, which is less than one minute at ₹${feePerMinute}/min. Paid consultations are on hold while we switch payment providers.`
-          : 'Your free consultation credit is used up. Paid consultations are on hold while we switch payment providers.',
+          ? `Your balance is ₹${rupees}, which is less than one minute at ₹${feePerMinute}/min. Top up your wallet to continue.`
+          : 'Your balance is empty. Top up your wallet to start a consultation.',
         code: 'OUT_OF_CREDIT',
         creditBalancePaise: creditPaise,
         feePerMinute,

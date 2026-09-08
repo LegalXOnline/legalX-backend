@@ -12,6 +12,7 @@ import { startKeepAlive } from './lib/keepAlive'
 import leadsRouter from './routes/leads'
 import applicationsRouter from './routes/applications'
 import paymentRouter from './routes/payment'
+import walletRouter from './routes/wallet'
 import authRouter from './routes/auth'
 import lawyersRouter from './routes/lawyers'
 import adminRouter from './routes/admin'
@@ -251,6 +252,7 @@ app.use('/api/jobs', jobsRouter)
 app.use('/api/leads', validateCsrf, leadsRouter)
 app.use('/api/applications', validateCsrf, applicationsRouter)
 app.use('/api/payment', validateCsrf, paymentRouter)
+app.use('/api/wallet', validateCsrf, walletRouter)
 app.use('/api/admin', validateCsrf, adminRouter)
 app.use('/api/consultations', validateCsrf, consultationsRouter)
 

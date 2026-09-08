@@ -203,6 +203,22 @@ export const messageSendSchema = z.object({
   { message: 'Type a message or attach a file' }
 )
 
+// ── Wallet ────────────────────────────────────────────────────────────────────
+
+/**
+ * A top-up, in paise. Floored at ₹50 because a smaller one costs more in
+ * gateway fees than it adds, and capped so a typo cannot become ₹5,00,000.
+ */
+export const walletTopupOrderSchema = z.object({
+  amountPaise: z.coerce.number().int().min(5000).max(5_000_00 * 100),
+})
+
+export const walletTopupVerifySchema = z.object({
+  razorpayOrderId: z.string().min(1).max(120),
+  razorpayPaymentId: z.string().min(1).max(120),
+  razorpaySignature: z.string().min(1).max(256),
+})
+
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),
 })
