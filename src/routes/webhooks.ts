@@ -313,7 +313,11 @@ router.post('/agora', async (req: Request, res: Response) => {
     }
 
     // ── Idempotency guard ─────────────────────────────────────────────────────
-    if (consultation.payment_status === 'paid' || consultation.status === 'completed') {
+    if (
+      consultation.payment_status === 'paid' ||
+      consultation.status === 'completed' ||
+      consultation.credits_charged_paise !== null
+    ) {
       logger.info({},  '[webhook/agora] Already processed — skip:', consultation.id)
       res.json({ received: true, skipped: true })
       return
@@ -334,6 +338,51 @@ router.post('/agora', async (req: Request, res: Response) => {
       feePerMinute, // minimum 1 minute charge
     )
     const totalAmountPaise = totalAmount * 100
+
+    // ── Settle from free credit ───────────────────────────────────────────────
+    // A credit-funded call never touched a gateway, so there is nothing to
+    // capture — the balance is debited by the measured duration instead. The
+    // RPC caps the debit at the hold and refuses to charge twice, which matters
+    // because Agora retries this delivery until it gets a 2xx.
+    let creditsChargedPaise: number | null = null
+
+    if (consultation.payment_status === 'credits') {
+      const { data: charged, error: creditErr } = await supabase.rpc('charge_consultation_credits', {
+        p_consultation_id: consultation.id,
+        p_amount_paise: totalAmountPaise,
+      })
+
+      if (creditErr) {
+        // Answer non-2xx so Agora redelivers: the call is over either way, but
+        // an unbilled consultation should not be silently written off.
+        logger.error({ err: creditErr.message, consultationId: consultation.id }, '[webhook/agora] credit debit failed')
+        res.status(500).json({ error: 'Could not settle consultation credit' })
+        return
+      }
+
+      creditsChargedPaise = Number(charged ?? 0)
+      logger.info(
+        { consultationId: consultation.id, creditsChargedPaise, durationSeconds },
+        '[webhook/agora] settled from free credit'
+      )
+
+      await supabase.from('consultations').update({
+        status: 'completed',
+        ended_at: endedAt.toISOString(),
+        duration_seconds: durationSeconds,
+        total_amount: totalAmount,
+      }).eq('id', consultation.id)
+
+      res.json({
+        received: true,
+        consultationId: consultation.id,
+        durationSeconds,
+        totalAmount,
+        fundedBy: 'credits',
+        creditsChargedPaise,
+      })
+      return
+    }
 
     // ── Capture Razorpay payment ──────────────────────────────────────────────
     let paymentCaptured = false

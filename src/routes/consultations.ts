@@ -45,11 +45,22 @@ function userIdToUid(userId: string): number {
   return hash.readUInt32BE(0)
 }
 
-function generateAgoraToken(channelName: string, userId: string, role: 'client' | 'host'): string {
+/**
+ * Both parties are issued a PUBLISHER token.
+ *
+ * A consultation is two-way: the client speaks as much as the lawyer, so a
+ * SUBSCRIBER token — which cannot publish audio or video — is wrong for either
+ * of them. It happens to work today only because the room joins with
+ * `mode: 'rtc'`, where Agora ignores the role; switching the client to
+ * `mode: 'live'` for any reason would silently mute every client with no error
+ * to trace. The `role` argument is kept because the caller uses it to say who
+ * is who, and it still decides nothing else.
+ */
+function generateAgoraToken(channelName: string, userId: string, _role: 'client' | 'host'): string {
   const appId = process.env.AGORA_APP_ID!
   const appCertificate = process.env.AGORA_APP_CERTIFICATE!
   const uid = userIdToUid(userId)
-  const agoraRole = role === 'host' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER
+  const agoraRole = RtcRole.PUBLISHER
   const expirationSecs = 3600 // 1 hour
   const currentTimestamp = Math.floor(Date.now() / 1000)
   const privilegeExpiredTs = currentTimestamp + expirationSecs
@@ -64,6 +75,15 @@ function generateAgoraToken(channelName: string, userId: string, role: 'client' 
     privilegeExpiredTs,
   )
 }
+
+/**
+ * Razorpay is switched off at the door while PhonePe is built.
+ *
+ * Left as an env flag rather than deleted code: the pre-auth flow below is the
+ * only capture-and-void implementation in the codebase, and PhonePe has no
+ * equivalent primitive. Turning it back on is one variable, not a rebuild.
+ */
+const RAZORPAY_MAINTENANCE = process.env.RAZORPAY_MAINTENANCE !== 'false'
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
 const initiateSchema = z.object({
@@ -106,6 +126,106 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
       video: Number(lawyer.consultation_fee_video) || 40,
     }
     const feePerMinute = feeMap[type]
+    const lawyerName = `${lawyer.first_name ?? ''} ${lawyer.last_name ?? ''}`.trim()
+
+    // ── Free credits ─────────────────────────────────────────────────────────
+    // Checked before any gateway is touched. A call the client's credit covers
+    // needs no payment at all, which is what makes the call flow testable
+    // without a live payment switch sitting in the middle of it.
+    const { data: account } = await supabase
+      .from('accounts').select('free_credit_paise').eq('id', user.id).maybeSingle()
+
+    const creditPaise = Number(account?.free_credit_paise ?? 0)
+    const perMinutePaise = feePerMinute * 100
+    // Credit buys whole minutes only: a call that can't fund its first minute
+    // would be cut off before anyone spoke.
+    const affordableMinutes = Math.floor(creditPaise / perMinutePaise)
+
+    if (affordableMinutes >= 1) {
+      const grantedMinutes = Math.min(maxMinutes, affordableMinutes)
+      const heldPaise = grantedMinutes * perMinutePaise
+
+      const { data: consultation, error: dbErr } = await supabase
+        .from('consultations')
+        .insert({
+          client_id: user.id,
+          lawyer_id: lawyerId,
+          type,
+          status: 'pending',
+          fee_per_minute: feePerMinute,
+          payment_status: 'credits',
+          credits_held_paise: heldPaise,
+          hms_room_id: null,
+        })
+        .select('id')
+        .single()
+
+      if (dbErr || !consultation) {
+        console.error('[consultations/initiate] credits insert failed', dbErr)
+        res.status(500).json({ error: 'Failed to create consultation' }); return
+      }
+
+      // The Agora channel is the consultation id. Nothing is created server
+      // side — the channel exists as soon as the first participant joins.
+      //
+      // Checked rather than fired and forgotten: /accept refuses a consultation
+      // with no room id, so a silent failure here surfaces later as the lawyer
+      // being told "Room not ready" for a call that looks fine to the client.
+      const { error: roomErr } = await supabase.from('consultations').update({
+        hms_room_id: consultation.id,
+        hms_session_id: consultation.id,
+      }).eq('id', consultation.id)
+
+      if (roomErr) {
+        console.error('[consultations/initiate] could not set channel', roomErr)
+        await supabase.from('consultations')
+          .update({ status: 'cancelled', payment_status: 'unpaid' })
+          .eq('id', consultation.id)
+        res.status(500).json({ error: 'Could not open the call room. Please try again.' })
+        return
+      }
+
+      // Ring the lawyer. The insert is what Supabase Realtime picks up and the
+      // SSE stream relays to their dashboard; 20 seconds is the window they
+      // have to answer before it lapses.
+      await supabase.from('consultation_notifications').insert({
+        consultation_id: consultation.id,
+        lawyer_id: lawyerId,
+        client_id: user.id,
+        type,
+        expires_at: new Date(Date.now() + 20_000).toISOString(),
+      })
+
+      res.status(201).json({
+        consultationId: consultation.id,
+        fundedBy: 'credits',
+        channelName: consultation.id,
+        agoraAppId: process.env.AGORA_APP_ID!,
+        authToken: generateAgoraToken(consultation.id, user.id, 'client'),
+        uid: userIdToUid(user.id),
+        creditHeldPaise: heldPaise,
+        creditBalancePaise: creditPaise,
+        lawyerName,
+        type,
+        feePerMinute,
+        maxMinutes: grantedMinutes,
+      })
+      return
+    }
+
+    // ── Paid ─────────────────────────────────────────────────────────────────
+    // Out of credit, so this needs a gateway. Razorpay is off while the
+    // PhonePe integration is built: creating a pre-authorisation we have no
+    // intention of capturing would put a real hold on a real card.
+    if (RAZORPAY_MAINTENANCE) {
+      res.status(503).json({
+        error: 'Paid consultations are on hold while we switch payment providers. Your free consultation credit still works.',
+        code: 'PAYMENTS_MAINTENANCE',
+        creditBalancePaise: creditPaise,
+      })
+      return
+    }
+
     const amountPaise = feePerMinute * maxMinutes * 100 // paise
 
     // Create Razorpay order with manual capture (pre-auth)
@@ -135,10 +255,11 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
 
     res.status(201).json({
       consultationId: consultation.id,
+      fundedBy: 'razorpay',
       razorpayOrderId: order.id,
       amount: amountPaise,
       currency: 'INR',
-      lawyerName: `${lawyer.first_name ?? ''} ${lawyer.last_name ?? ''}`.trim(),
+      lawyerName,
       type,
       feePerMinute,
       maxMinutes,
