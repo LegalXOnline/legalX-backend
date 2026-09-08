@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express'
+import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { logger } from '../lib/logger'
 import {
@@ -112,9 +113,36 @@ router.get('/stream', async (req: Request, res: Response) => {
   res.flushHeaders()
   res.write('event: connected\ndata: {"ok":true}\n\n')
 
+  /**
+   * One channel per connection, not per user.
+   *
+   * supabase-js caches channels by topic, so a second connection for the same
+   * account got handed the first one — already subscribed — and adding a
+   * listener to it threw:
+   *
+   *   cannot add `postgres_changes` callbacks for realtime:sse-notifications-…
+   *   after `subscribe()`
+   *
+   * Which is not an edge case: it happens with two tabs open, and on every
+   * reconnect that overlaps the connection it is replacing. The suffix makes
+   * each connection's topic its own.
+   */
+  const streamId = crypto.randomUUID()
+
+  // Anything that throws from here on has to be handled here.
+  //
+  // The headers went out at flushHeaders() above, so the global error handler
+  // cannot answer — it tried, and produced a second, more confusing failure:
+  //
+  //   Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent
+  //
+  // A stream that cannot be set up is closed rather than left open pretending
+  // to work; the client's own reconnect and the four-second poll both cover it.
+  try {
+
   // General in-app notifications for this account.
   const notifChannel = supabase
-    .channel(`sse-notifications-${user.id}`)
+    .channel(`sse-notifications-${user.id}-${streamId}`)
     .on(
       'postgres_changes',
       { event: 'INSERT', schema: 'public', table: 'notifications', filter: `account_id=eq.${user.id}` },
@@ -137,7 +165,7 @@ router.get('/stream', async (req: Request, res: Response) => {
   // expire in seconds and drive a full-screen prompt rather than the bell.
   const callChannel = user.role === 'lawyer'
     ? supabase
-        .channel(`sse-lawyer-calls-${user.id}`)
+        .channel(`sse-lawyer-calls-${user.id}-${streamId}`)
         .on(
           'postgres_changes',
           { event: 'INSERT', schema: 'public', table: 'consultation_notifications', filter: `lawyer_id=eq.${user.id}` },
@@ -161,9 +189,16 @@ router.get('/stream', async (req: Request, res: Response) => {
 
   req.on('close', () => {
     clearInterval(heartbeat)
-    supabase.removeChannel(notifChannel)
-    if (callChannel) supabase.removeChannel(callChannel)
+    supabase.removeChannel(notifChannel).catch(() => {})
+    if (callChannel) supabase.removeChannel(callChannel).catch(() => {})
   })
+
+  } catch (err) {
+    logger.error({ reqId: req.id, err }, '[notifications/stream] could not open the stream')
+    // Told over the stream itself, since that is the only channel still open.
+    try { res.write('event: error\ndata: {"ok":false}\n\n') } catch { /* already gone */ }
+    res.end()
+  }
 })
 
 // ── GET /api/notifications ───────────────────────────────────────────────────
