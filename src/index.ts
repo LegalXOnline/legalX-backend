@@ -116,7 +116,17 @@ const validateCsrf = (req: express.Request, res: express.Response, next: express
 }
 
 // ── Security middleware ───────────────────────────────────────────────────────
-app.use(helmet())
+/**
+ * crossOriginResourcePolicy is relaxed to cross-origin because the browser now
+ * opens the notification stream against this host directly rather than through
+ * the frontend's /api rewrite — that rewrite is proxied by Vercel's function
+ * layer, which buffers response bodies and so never delivers an event stream.
+ * Everything else stays at helmet's defaults, and CORS still decides which
+ * origins are allowed at all.
+ */
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}))
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim())
 app.use(cors({
