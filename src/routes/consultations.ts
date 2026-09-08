@@ -364,6 +364,211 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
   }
 })
 
+/**
+ * Settles a consultation: measures it, charges it, closes it.
+ *
+ * One implementation, two callers: the call room hanging up and the portal's
+ * Mark complete button. Billing that lives in several places is billing that
+ * disagrees with itself, and a consultation ended one way should cost exactly
+ * what it costs ended another.
+ *
+ * Agora's channel-destroy webhook keeps its own copy for now, because it also
+ * captures a Razorpay pre-authorisation — a path this does not cover and which
+ * should not be quietly deleted while the gateway is only paused.
+ *
+ * Safe to call twice: an already-settled consultation is returned untouched,
+ * and the credit debit refuses to charge the same consultation again.
+ */
+export async function settleConsultation(id: string): Promise<{
+  ok: boolean
+  answered: boolean
+  durationSeconds: number
+  totalAmount: number
+  creditsChargedPaise: number | null
+  alreadySettled?: boolean
+}> {
+  const { data: consultation, error } = await supabase
+    .from('consultations').select('*').eq('id', id).maybeSingle()
+
+  if (error) throw error
+  if (!consultation) throw new Error('Consultation not found')
+
+  // Whoever finishes second finds it done.
+  if (consultation.status === 'completed' || consultation.credits_charged_paise !== null) {
+    return {
+      ok: true,
+      alreadySettled: true,
+      answered: Boolean(consultation.started_at),
+      durationSeconds: consultation.duration_seconds ?? 0,
+      totalAmount: Number(consultation.total_amount ?? 0),
+      creditsChargedPaise: consultation.credits_charged_paise ?? null,
+    }
+  }
+
+  const endedAt = new Date()
+  const startedAt = consultation.started_at ? new Date(consultation.started_at) : null
+
+  // started_at is stamped when the lawyer joins. Without it nobody ever did, so
+  // this is a missed call: recorded, and free.
+  if (!startedAt) {
+    await supabase.from('consultations').update({
+      status: 'cancelled',
+      ended_at: endedAt.toISOString(),
+      duration_seconds: 0,
+      total_amount: 0,
+      credits_charged_paise: consultation.payment_status === 'credits' ? 0 : null,
+    }).eq('id', id)
+
+    return { ok: true, answered: false, durationSeconds: 0, totalAmount: 0, creditsChargedPaise: 0 }
+  }
+
+  const durationSeconds = Math.max(0, Math.floor((endedAt.getTime() - startedAt.getTime()) / 1000))
+  const feePerMinute = Number(consultation.fee_per_minute)
+  const totalAmount = Math.max(
+    Math.ceil((durationSeconds / 60) * feePerMinute),
+    feePerMinute, // a call that connected bills at least its first minute
+  )
+
+  let creditsChargedPaise: number | null = null
+  if (consultation.payment_status === 'credits') {
+    const { data: charged, error: creditErr } = await supabase.rpc('charge_consultation_credits', {
+      p_consultation_id: id,
+      p_amount_paise: totalAmount * 100,
+    })
+    if (creditErr) {
+      logger.error({ err: creditErr.message, consultationId: id }, '[settle] credit debit failed')
+      throw new Error('Could not settle this consultation.')
+    }
+    creditsChargedPaise = Number(charged ?? 0)
+  }
+
+  const { error: updateErr } = await supabase.from('consultations').update({
+    status: 'completed',
+    ended_at: endedAt.toISOString(),
+    duration_seconds: durationSeconds,
+    total_amount: totalAmount,
+  }).eq('id', id)
+  if (updateErr) throw updateErr
+
+  logger.info({ consultationId: id, durationSeconds, totalAmount, creditsChargedPaise }, '[settle] done')
+
+  return { ok: true, answered: true, durationSeconds, totalAmount, creditsChargedPaise }
+}
+
+// ── GET /api/consultations/lawyer?status= ────────────────────────────────────
+/**
+ * The lawyer's own consultations, for the portal list.
+ *
+ * The portal has been calling this since it was written and it did not exist —
+ * apiGetPortalConsultations caught the 404 and returned an empty array, so the
+ * Consultations page and "Today's consultations" were permanently empty no
+ * matter how many calls had happened.
+ *
+ * The portal's tabs and the database do not use the same words, and that gap is
+ * the whole reason this needs a mapping rather than a passthrough:
+ *
+ *   pending   → pending      waiting for this lawyer to answer
+ *   upcoming  → in_progress  answered and running now
+ *   completed → completed
+ *   cancelled → cancelled    declined, missed, or hung up before anyone joined
+ *
+ * MUST be registered before GET /:id-shaped routes.
+ */
+router.get('/lawyer', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+    if (user.role !== 'lawyer') { res.status(403).json({ error: 'Not a lawyer account' }); return }
+
+    const TAB_TO_STATUS: Record<string, string[]> = {
+      pending:   ['pending'],
+      upcoming:  ['in_progress'],
+      active:    ['in_progress'],
+      completed: ['completed'],
+      cancelled: ['cancelled'],
+    }
+
+    const tab = String(req.query.status ?? '')
+    const statuses = TAB_TO_STATUS[tab]
+
+    let query = supabase
+      .from('consultations')
+      .select('id, type, status, client_id, started_at, ended_at, duration_seconds, fee_per_minute, total_amount, hms_room_id, created_at')
+      .eq('lawyer_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(100)
+
+    if (statuses) query = query.in('status', statuses)
+
+    const { data, error } = await query
+    if (error) throw error
+    const rows = data ?? []
+
+    // Client names in one round trip rather than one per row.
+    const clientIds = [...new Set(rows.map(r => r.client_id).filter(Boolean))]
+    const names = new Map<string, string>()
+    if (clientIds.length) {
+      const { data: accounts } = await supabase
+        .from('accounts')
+        .select('id, first_name, last_name')
+        .in('id', clientIds)
+      for (const a of accounts ?? []) {
+        names.set(a.id, [a.first_name, a.last_name].filter(Boolean).join(' ').trim() || 'Client')
+      }
+    }
+
+    res.json(rows.map(r => ({
+      id: r.id,
+      type: r.type,
+      // Reported in the portal's own vocabulary, so the tab a row arrives in
+      // matches the badge printed on it.
+      status: r.status === 'in_progress' ? 'active' : r.status,
+      scheduledAt: r.started_at ?? r.created_at,
+      clientName: names.get(r.client_id) ?? 'Client',
+      clientId: r.client_id,
+      caseNote: null,
+      postCallNote: null,
+      durationMin: r.duration_seconds != null ? Math.round(r.duration_seconds / 60) : null,
+      fee: Number(r.total_amount ?? 0) || Number(r.fee_per_minute ?? 0),
+      agoraChannel: r.hms_room_id ?? r.id,
+    })))
+  } catch (err) {
+    console.error('[consultations/lawyer]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── PATCH /api/consultations/:id/complete ────────────────────────────────────
+/**
+ * Marks a consultation finished from the portal list.
+ *
+ * The button existed and the route did not. Settlement is the same path a
+ * hang-up takes, so a call closed from here is billed and recorded identically
+ * to one closed from the room — there is no second way to end a consultation,
+ * only a second place to press it.
+ */
+router.patch('/:id/complete', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const { data: consultation } = await supabase
+      .from('consultations')
+      .select('lawyer_id')
+      .eq('id', String(req.params.id))
+      .maybeSingle()
+
+    if (!consultation) { res.status(404).json({ error: 'Consultation not found' }); return }
+    if (consultation.lawyer_id !== user.id) { res.status(403).json({ error: 'Not your consultation' }); return }
+
+    await settleConsultation(String(req.params.id))
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[consultations/complete]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // ── GET /api/consultations/incoming ──────────────────────────────────────────
 /**
  * The call ringing for this lawyer right now, if any.
@@ -594,79 +799,15 @@ router.post('/:id/end', async (req: Request, res: Response) => {
     if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
 
     const id = String(req.params.id)
-    const { data: consultation, error } = await supabase
-      .from('consultations').select('*').eq('id', id).maybeSingle()
+    const { data: consultation } = await supabase
+      .from('consultations').select('client_id, lawyer_id').eq('id', id).maybeSingle()
 
-    if (error) throw error
     if (!consultation) { res.status(404).json({ error: 'Consultation not found' }); return }
-
     if (consultation.client_id !== user.id && consultation.lawyer_id !== user.id) {
       res.status(403).json({ error: 'You are not a participant in this consultation' }); return
     }
 
-    // Whoever hangs up second finds it already settled.
-    if (consultation.status === 'completed' || consultation.credits_charged_paise !== null) {
-      res.json({
-        ok: true,
-        alreadySettled: true,
-        durationSeconds: consultation.duration_seconds ?? 0,
-        totalAmount: Number(consultation.total_amount ?? 0),
-      })
-      return
-    }
-
-    const endedAt = new Date()
-    const startedAt = consultation.started_at ? new Date(consultation.started_at) : null
-
-    // started_at is stamped when the lawyer accepts. Without it nobody ever
-    // joined, so this is a missed call: recorded, and free.
-    if (!startedAt) {
-      await supabase.from('consultations').update({
-        status: 'cancelled',
-        ended_at: endedAt.toISOString(),
-        duration_seconds: 0,
-        total_amount: 0,
-        credits_charged_paise: consultation.payment_status === 'credits' ? 0 : null,
-      }).eq('id', id)
-
-      res.json({ ok: true, answered: false, durationSeconds: 0, totalAmount: 0 })
-      return
-    }
-
-    const durationSeconds = Math.max(0, Math.floor((endedAt.getTime() - startedAt.getTime()) / 1000))
-    const feePerMinute = Number(consultation.fee_per_minute)
-    const totalAmount = Math.max(
-      Math.ceil((durationSeconds / 60) * feePerMinute),
-      feePerMinute, // a call that connected bills at least its first minute
-    )
-
-    let creditsChargedPaise: number | null = null
-    if (consultation.payment_status === 'credits') {
-      const { data: charged, error: creditErr } = await supabase.rpc('charge_consultation_credits', {
-        p_consultation_id: id,
-        p_amount_paise: totalAmount * 100,
-      })
-      if (creditErr) {
-        logger.error({ err: creditErr.message, consultationId: id }, '[consultations/end] credit debit failed')
-        res.status(500).json({ error: 'Could not settle this consultation.' }); return
-      }
-      creditsChargedPaise = Number(charged ?? 0)
-    }
-
-    const { error: updateErr } = await supabase.from('consultations').update({
-      status: 'completed',
-      ended_at: endedAt.toISOString(),
-      duration_seconds: durationSeconds,
-      total_amount: totalAmount,
-    }).eq('id', id)
-    if (updateErr) throw updateErr
-
-    logger.info(
-      { consultationId: id, durationSeconds, totalAmount, creditsChargedPaise },
-      '[consultations/end] settled'
-    )
-
-    res.json({ ok: true, answered: true, durationSeconds, totalAmount, creditsChargedPaise })
+    res.json(await settleConsultation(id))
   } catch (err) {
     console.error('[consultations/end]', err)
     res.status(500).json({ error: 'Internal server error' })
@@ -679,11 +820,11 @@ router.post('/:id/end', async (req: Request, res: Response) => {
  * The conversation for a consultation, created on first use.
  *
  * Lazily rather than at accept time: whoever opens the room first creates it,
- * which means a conversation only exists once somebody actually looked, and
- * there is no ordering to get wrong between the two participants arriving.
+ * so a conversation exists only once somebody has looked, and there is no
+ * ordering to get wrong between the two participants arriving.
  *
- * Returns null when the caller is not a participant — the check belongs here,
- * once, rather than in each route that reads or writes messages.
+ * Returns an error marker when the caller is not a participant — the check
+ * belongs here, once, rather than in each route that reads or writes messages.
  */
 async function conversationFor(consultationId: string, userId: string) {
   const { data: consultation } = await supabase
