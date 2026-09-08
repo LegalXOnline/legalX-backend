@@ -1,6 +1,9 @@
 import { Router, Request, Response } from 'express'
 import multer from 'multer'
 import { createClient } from '@supabase/supabase-js'
+// The shared service-role client, for the one DB read this route needs. The
+// two clients below stay separate for the reason described under them.
+import { supabase } from '../lib/supabase'
 
 const router = Router()
 
@@ -95,6 +98,66 @@ router.post('/lawyer-doc', upload.single('file'), async (req: Request, res: Resp
     if (err.message?.includes('Only JPG')) return res.status(400).json({ error: err.message })
     if (err.code === 'LIMIT_FILE_SIZE')    return res.status(400).json({ error: 'File too large. Maximum 5 MB.' })
     console.error('[upload/lawyer-doc] Unexpected error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/**
+ * A document sent inside a consultation.
+ *
+ * Separate from /lawyer-doc because that route is lawyers only, and in a chat
+ * the client is usually the one with the notice, the receipt or the lease. Both
+ * participants can upload here; neither can upload to a consultation they are
+ * not in.
+ *
+ * Stored under the consultation, so what was shared during a matter stays
+ * findable with it rather than in a flat pile keyed by uploader.
+ */
+router.post('/chat-attachment', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (!req.file) return res.status(400).json({ error: 'No file provided' })
+
+    const consultationId = String(req.query.consultationId ?? '')
+    if (!/^[0-9a-f-]{36}$/i.test(consultationId)) {
+      return res.status(400).json({ error: 'consultationId is required' })
+    }
+
+    const { data: consultation } = await supabase
+      .from('consultations')
+      .select('id, client_id, lawyer_id')
+      .eq('id', consultationId)
+      .maybeSingle()
+
+    if (!consultation) return res.status(404).json({ error: 'Consultation not found' })
+    if (consultation.client_id !== user.id && consultation.lawyer_id !== user.id) {
+      return res.status(403).json({ error: 'Not your consultation' })
+    }
+
+    const ext = req.file.mimetype === 'application/pdf' ? 'pdf'
+      : req.file.mimetype === 'image/png' ? 'png' : 'jpg'
+
+    const storagePath = `chat/${consultationId}/${Date.now()}-${user.id.slice(0, 8)}.${ext}`
+
+    const { error: uploadError } = await storageClient.storage
+      .from('legalx-lawyer-docs')
+      .upload(storagePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false })
+
+    if (uploadError) {
+      console.error('[upload/chat-attachment]', uploadError.message)
+      return res.status(500).json({ error: 'Upload failed. Please try again.' })
+    }
+
+    return res.json({
+      path: storagePath,
+      name: req.file.originalname?.slice(0, 255) ?? `document.${ext}`,
+      size: req.file.size,
+    })
+  } catch (err: any) {
+    if (err.message?.includes('Only JPG')) return res.status(400).json({ error: err.message })
+    if (err.code === 'LIMIT_FILE_SIZE')    return res.status(400).json({ error: 'File too large. Maximum 5 MB.' })
+    console.error('[upload/chat-attachment] unexpected', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })

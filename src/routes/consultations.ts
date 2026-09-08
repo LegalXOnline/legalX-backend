@@ -480,7 +480,7 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     const consultationId = String(req.params.id)
     const { data: consultation, error } = await supabase
       .from('consultations')
-      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at')
+      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at, fee_per_minute')
       .eq('id', consultationId)
       .single()
 
@@ -539,6 +539,18 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     const channelName = consultation.hms_room_id || consultation.id
     const token = generateAgoraToken(channelName, user.id, isLawyer ? 'host' : 'client')
 
+    // Who the other person is, so the room can name them instead of saying
+    // "Your lawyer" over a real consultation.
+    const counterpartId = isLawyer ? consultation.client_id : consultation.lawyer_id
+    const { data: counterpart } = await supabase
+      .from('accounts')
+      .select('first_name, last_name')
+      .eq('id', counterpartId)
+      .maybeSingle()
+
+    const counterpartName =
+      [counterpart?.first_name, counterpart?.last_name].filter(Boolean).join(' ').trim() || null
+
     res.json({
       consultationId,
       channelName,
@@ -548,7 +560,9 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       role: isLawyer ? 'lawyer' : 'client',
       type: consultation.type,
       status: consultation.status,
-      counterpartId: isLawyer ? consultation.client_id : consultation.lawyer_id,
+      counterpartId,
+      counterpartName,
+      feePerMinute: Number(consultation.fee_per_minute) || null,
     })
   } catch (err) {
     console.error('[consultations/agora-token]', err)
@@ -736,7 +750,7 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('messages')
-      .select('id, sender_id, content, created_at')
+      .select('id, sender_id, content, attachment_url, attachment_name, attachment_size, created_at')
       .eq('conversation_id', found.conversationId)
       .order('created_at', { ascending: true })
       .limit(500)
@@ -781,16 +795,20 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
       return
     }
 
-    const { content } = req.body as { content: string }
+    const { content, attachmentUrl, attachmentName, attachmentSize } =
+      req.body as { content?: string; attachmentUrl?: string; attachmentName?: string; attachmentSize?: number }
 
     const { data: message, error } = await supabase
       .from('messages')
       .insert({
         conversation_id: found.conversationId,
         sender_id: user.id,
-        content,
+        content: content ?? null,
+        attachment_url: attachmentUrl ?? null,
+        attachment_name: attachmentName ?? null,
+        attachment_size: attachmentSize ?? null,
       })
-      .select('id, sender_id, content, created_at')
+      .select('id, sender_id, content, attachment_url, attachment_name, attachment_size, created_at')
       .single()
 
     if (error) throw error
@@ -802,7 +820,7 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
 
     void sendPushToAccount(other, {
       title: 'New message',
-      body: content.slice(0, 120),
+      body: content?.slice(0, 120) || (attachmentName ? `Sent ${attachmentName}` : 'Sent a document'),
       url: `/consultation/${consultationId}`,
       tag: `chat-${consultationId}`,
     }).catch(() => { /* the message is saved either way */ })
@@ -810,6 +828,55 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
     res.status(201).json({ message })
   } catch (err) {
     console.error('[consultations/messages POST]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── GET /api/consultations/:id/attachment ────────────────────────────────────
+/**
+ * Redirects to a freshly signed URL for one attachment in this consultation.
+ *
+ * The bucket is private, so the stored path renders nothing on its own. Signed
+ * per request rather than stored, because a signed URL expires and a document
+ * attached to a legal matter has to keep opening. The path is checked against
+ * the consultation so a participant cannot read another matter's files by
+ * editing the query string.
+ */
+router.get('/:id/attachment', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const consultationId = String(req.params.id)
+    const path = String(req.query.path ?? '')
+
+    const { data: consultation } = await supabase
+      .from('consultations')
+      .select('client_id, lawyer_id')
+      .eq('id', consultationId)
+      .maybeSingle()
+
+    if (!consultation) { res.status(404).json({ error: 'Not found' }); return }
+    if (consultation.client_id !== user.id && consultation.lawyer_id !== user.id) {
+      res.status(403).json({ error: 'Not your consultation' }); return
+    }
+
+    // The prefix is the authorisation: a path outside this consultation's
+    // folder is not this consultation's document, whoever is asking.
+    if (!path.startsWith(`chat/${consultationId}/`)) {
+      res.status(403).json({ error: 'Not a document from this consultation' }); return
+    }
+
+    const { data: signed, error } = await supabase.storage
+      .from('legalx-lawyer-docs')
+      .createSignedUrl(path, 3600)
+
+    if (error || !signed?.signedUrl) { res.status(404).json({ error: 'Not found' }); return }
+
+    res.set('Cache-Control', 'private, max-age=1800')
+    res.redirect(302, signed.signedUrl)
+  } catch (err) {
+    console.error('[consultations/attachment]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })

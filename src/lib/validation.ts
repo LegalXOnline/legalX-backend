@@ -192,8 +192,16 @@ export const pushUnsubscribeSchema = z.object({
  * record, so an unbounded field would be a liability as well as a footgun.
  */
 export const messageSendSchema = z.object({
-  content: z.string().min(1, 'Type a message first').max(4000).trim(),
-})
+  content: z.string().max(4000).trim().optional(),
+  // A storage path, never a URL — the file lives in a private bucket and is
+  // signed on read.
+  attachmentUrl: z.string().max(500).optional(),
+  attachmentName: z.string().max(255).optional(),
+  attachmentSize: z.coerce.number().int().min(0).max(20 * 1024 * 1024).optional(),
+}).refine(
+  v => (v.content && v.content.length > 0) || v.attachmentUrl,
+  { message: 'Type a message or attach a file' }
+)
 
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),

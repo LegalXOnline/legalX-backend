@@ -144,6 +144,73 @@ router.get('/me', async (req: Request, res: Response) => {
   }
 })
 
+// ── GET /api/lawyers/me/stats ────────────────────────────────────────────────
+/**
+ * Real figures for the portal's headline cards.
+ *
+ * They were showing lawyer_profiles.cases_handled — a static profile field
+ * nothing increments — and two literal em dashes. So a lawyer who had just
+ * finished three consultations was told they had handled none, which reads as
+ * the platform losing their work rather than as a stale placeholder.
+ *
+ * Everything here is counted from consultations at request time. Nothing is
+ * cached and nothing is denormalised onto the profile, because a counter that
+ * has to be kept in step is a counter that eventually is not.
+ *
+ * MUST be registered before GET /:slug.
+ */
+router.get('/me/stats', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (user.role !== 'lawyer') return res.status(403).json({ error: 'Not a lawyer account' })
+
+    const now = new Date()
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+
+    // Only completed ones count. A call nobody answered is not work done, and
+    // billing already treats it that way.
+    const [monthRes, allRes, reviewRes] = await Promise.all([
+      supabase
+        .from('consultations')
+        .select('duration_seconds, total_amount')
+        .eq('lawyer_id', user.id)
+        .eq('status', 'completed')
+        .gte('created_at', monthStart),
+      supabase
+        .from('consultations')
+        .select('id', { count: 'exact', head: true })
+        .eq('lawyer_id', user.id)
+        .eq('status', 'completed'),
+      supabase
+        .from('reviews')
+        .select('rating')
+        .eq('account_id', user.id),
+    ])
+
+    const month = monthRes.data ?? []
+    const seconds = month.reduce((sum, c) => sum + Number(c.duration_seconds ?? 0), 0)
+    const earned = month.reduce((sum, c) => sum + Number(c.total_amount ?? 0), 0)
+
+    const ratings = (reviewRes.data ?? []).map(r => Number(r.rating)).filter(n => Number.isFinite(n))
+    const avgRating = ratings.length
+      ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10
+      : null
+
+    return res.json({
+      consultationsThisMonth: month.length,
+      totalHandled: allRes.count ?? 0,
+      minutesThisMonth: Math.round(seconds / 60),
+      earnedThisMonth: earned,
+      avgRating,
+      reviewCount: ratings.length,
+    })
+  } catch (err) {
+    console.error('[lawyers/me/stats]', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // ── GET /api/lawyers/settings ────────────────────────────────────────────────
 /**
  * What the lawyer can edit about themselves.
