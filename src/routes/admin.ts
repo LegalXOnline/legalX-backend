@@ -13,6 +13,7 @@ import {
   adminSuspendBodySchema,
   adminReinstateBodySchema,
   adminFlagBodySchema,
+  adminRequestInfoSchema,
   adminBulkLawyerSchema,
   adminWalletAdjustSchema,
   adminDisputeUpdateSchema,
@@ -31,7 +32,7 @@ import {
   adminAccountListQuerySchema,
   adminAccountDeleteSchema,
 } from '../lib/validation'
-import { sendLawyerApproved, sendLawyerRejected } from '../lib/email'
+import { sendLawyerApproved, sendLawyerRejected, sendLawyerInfoRequest } from '../lib/email'
 import { createNotification } from '../lib/notify'
 import { startIngest, getIngestJob, cancelIngest, draftFromSource } from '../lib/shortsPipeline'
 import { FEED_SOURCES } from '../lib/sources/rss'
@@ -300,6 +301,71 @@ router.post('/lawyers/:id/flag', requireAdmin, validateParams(lawyerIdParamSchem
     })
 
     return res.status(201).json({ flag })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── POST /api/admin/lawyers/:id/request-info ─────────────────────────────────
+/**
+ * Ask a lawyer for something missing, and actually tell them.
+ *
+ * The portal's "Request Info" button used to write a disciplinary_flags row of
+ * type 'complaint'. That was wrong twice over: the lawyer was never told
+ * anything had been asked, so their application sat waiting on a document
+ * nobody had requested out loud; and a missing certificate was recorded against
+ * them as misconduct, in the same table as suspensions.
+ *
+ * This notifies them in the portal and emails the message verbatim. It changes
+ * no status — the application stays exactly where it was in the queue.
+ */
+router.post('/lawyers/:id/request-info', requireAdmin, validateParams(lawyerIdParamSchema), validateBody(adminRequestInfoSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = String(req.params.id)
+    const { message } = req.body as { message: string }
+
+    const { data: lawyer } = await supabase
+      .from('lawyer_profiles')
+      .select('account_id, first_name, last_name')
+      .eq('account_id', id)
+      .maybeSingle()
+    if (!lawyer) return res.status(404).json({ error: 'Lawyer not found' })
+
+    const { data: account } = await supabase
+      .from('accounts').select('email, first_name').eq('id', id).maybeSingle()
+
+    if (!account?.email) {
+      return res.status(400).json({
+        error: 'This lawyer has no email address on file, so the request cannot reach them.',
+      })
+    }
+
+    // In-portal first: it is the record that survives whatever the mail server
+    // does, and it is what they see next time they sign in.
+    await createNotification({
+      accountId: id,
+      title: 'Information needed for your verification',
+      message,
+      type: 'verification',
+      link: '/onboarding/lawyer',
+    })
+
+    // Awaited, not fired and forgotten: the admin is told whether it went. A
+    // silent failure here recreates the exact problem this route replaces.
+    await sendLawyerInfoRequest(
+      account.email,
+      account.first_name ?? lawyer.first_name ?? '',
+      message
+    )
+
+    await writeAudit(req, {
+      action: 'REQUEST_LAWYER_INFO',
+      entityType: 'lawyer',
+      entityId: id,
+      after: { message },
+    })
+
+    return res.status(201).json({ sent: true, email: account.email })
   } catch (err) {
     next(err)
   }

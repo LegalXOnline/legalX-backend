@@ -622,6 +622,62 @@ export async function sendLawyerDocsReceivedConfirmation(email: string, firstNam
 }
 
 // ── Lawyer: approved ──────────────────────────────────────────────────────────
+/**
+ * Admin needs something more before verification can proceed.
+ *
+ * Sent because the request is useless if the lawyer never hears it: this used
+ * to be recorded as a disciplinary flag in the admin portal and nowhere else,
+ * so the application sat waiting on a document nobody had asked for out loud.
+ */
+export async function sendLawyerInfoRequest(email: string, firstName: string, message: string) {
+  const greeting = firstName ? `Hi ${firstName},` : 'Hi,'
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: email,
+      subject: 'We need one more thing for your LegalX verification',
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <div style="text-align:center;margin-bottom:28px">
+            <h1 style="font-size:28px;font-weight:800;color:#111;letter-spacing:-0.5px;margin:0">
+              Legal<span style="color:#C9A227">X</span>
+            </h1>
+            <p style="color:#888;font-size:13px;margin:4px 0 0">legalxonline.com</p>
+          </div>
+
+          <h2 style="margin:0 0 8px;color:#111;font-size:22px">One more thing before we can verify you</h2>
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 20px">
+            ${greeting} our verification team has reviewed your application and needs a
+            little more from you before it can go through.
+          </p>
+
+          <div style="background:#F9F6EF;border-left:3px solid #C9A227;padding:16px 18px;margin:0 0 22px">
+            <p style="margin:0;color:#333;font-size:14px;line-height:1.7;white-space:pre-wrap">${message}</p>
+          </div>
+
+          <p style="color:#555;font-size:14px;line-height:1.7;margin:0 0 24px">
+            Reply to this email with what we have asked for, or sign in and update your
+            profile. Your application stays exactly where it is in the queue — nothing
+            has been rejected.
+          </p>
+
+          <div style="margin-top:32px;padding-top:20px;border-top:1px solid #EEE">
+            <p style="color:#888;font-size:12px;line-height:1.6;margin:0">
+              Questions? Reach us at
+              <a href="mailto:contact@legalxonline.com" style="color:#C9A227">contact@legalxonline.com</a>.
+            </p>
+            <p style="color:#aaa;font-size:11px;margin:16px 0 0;text-align:center">
+              LegalXOnline &middot; Nandlalpur, Kahalgaon, Bhagalpur, Bihar &ndash; 813222
+            </p>
+          </div>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] sendLawyerInfoRequest failed:', err)
+  }
+}
+
 export async function sendLawyerApproved(email: string, firstName: string) {
   try {
     await resend.emails.send({

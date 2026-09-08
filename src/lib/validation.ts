@@ -135,8 +135,50 @@ export const contactFormSchema = z.object({
   message: z.string().min(10, 'Message must be at least 10 characters').max(2000).trim(),
 })
 
+/**
+ * Lawyer's own profile edits. Every field optional — the settings form sends a
+ * partial update, and a missing key must mean "leave it alone" rather than
+ * "clear it". Nothing here can change verification status: editing a rate is
+ * not re-applying for approval.
+ */
+export const lawyerSettingsUpdateSchema = z.object({
+  firstName: z.string().min(1).max(50).trim().optional(),
+  lastName: z.string().min(1).max(50).trim().optional(),
+  bio: z.string().max(3000).trim().nullable().optional(),
+  firmName: z.string().max(150).trim().nullable().optional(),
+  profilePhotoUrl: z.string().max(1000).trim().nullable().optional(),
+  languages: z.array(z.string().max(40)).max(12).optional(),
+  courtsPracticed: z.array(z.string().max(80)).max(20).optional(),
+  linkedinUrl: z.string().max(300).trim().nullable().optional(),
+  websiteUrl: z.string().max(300).trim().nullable().optional(),
+  draftingEnabled: z.boolean().optional(),
+  verificationEnabled: z.boolean().optional(),
+  consultationTypes: z.array(z.enum(['chat', 'voice', 'video'])).max(3).optional(),
+  // Floor of 25/min is platform policy; the ceiling stops a typo turning a
+  // 30-rupee call into a 30,000-rupee one.
+  feeChat: z.coerce.number().min(25).max(5000).optional(),
+  feeVoice: z.coerce.number().min(25).max(5000).optional(),
+  feeVideo: z.coerce.number().min(25).max(5000).optional(),
+  upiId: z.string().max(100).trim().nullable().optional(),
+  gstNumber: z.string().max(20).trim().nullable().optional(),
+  panNumber: z.string().max(15).trim().nullable().optional(),
+  // The settings form has always sent these. Without them in the schema they
+  // were stripped by validateBody and dropped in silence — the fields would
+  // reappear empty on the next load with no error to explain it.
+  bankAccountName: z.string().max(120).trim().nullable().optional(),
+  bankIfsc: z.string().max(15).trim().nullable().optional(),
+})
+
 export const lawyerIdParamSchema = z.object({
   id: z.string().uuid(),
+})
+
+/**
+ * What the admin needs from the lawyer. Required and reasonably long: the
+ * message is sent to them verbatim, and "send more documents" helps nobody.
+ */
+export const adminRequestInfoSchema = z.object({
+  message: z.string().min(10, 'Say what is needed — this is emailed to the lawyer').max(1000).trim(),
 })
 
 export const adminLawyerRejectBodySchema = z.object({

@@ -4,6 +4,7 @@ import {
   sendLawyerDocsSubmittedAdmin,
   sendLawyerDocsReceivedConfirmation,
 } from '../lib/email'
+import { validateBody, lawyerSettingsUpdateSchema } from '../lib/validation'
 
 const router = Router()
 
@@ -63,7 +64,9 @@ function mapRow(d: any) {
     name:            `${d.first_name ?? ''} ${d.last_name ?? ''}`.trim(),
     initials:        `${d.first_name?.[0] ?? ''}${d.last_name?.[0] ?? ''}`,
     avatarBg:        avatarTone(String(d.account_id ?? d.first_name ?? '')),
-    avatarUrl:       d.profile_photo_url ?? null,
+    // The endpoint, not the storage path: the bucket is private, so the path
+    // itself renders nothing.
+    avatarUrl:       d.profile_photo_url ? `/api/lawyers/${d.account_id}/photo` : null,
     barNumber:       d.bar_council_number ?? '',
     barState:        d.bar_council_state ?? '',
     verified:        d.verification_status === 'verified',
@@ -86,7 +89,9 @@ function mapRow(d: any) {
     achievements:    d.achievements ?? [],
     consultationTypes: d.consultation_types ?? ['chat', 'voice', 'video'],
     fees: {
-      chat:  Number(d.consultation_fee_chat)  || 20,
+      // Matches the ₹25/min floor the settings form enforces, so a lawyer who
+      // never set a rate is not advertised below the platform minimum.
+      chat:  Number(d.consultation_fee_chat)  || 25,
       voice: Number(d.consultation_fee_voice) || 30,
       video: Number(d.consultation_fee_video) || 40,
     },
@@ -136,6 +141,214 @@ router.get('/me', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[lawyers/me] error:', err)
     return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── GET /api/lawyers/settings ────────────────────────────────────────────────
+/**
+ * What the lawyer can edit about themselves.
+ *
+ * The settings page has been calling this and PATCH /settings since it was
+ * written, and neither existed: the GET 404'd into a catch that returned null,
+ * so the form rendered empty, and Save 404'd silently. This is that endpoint.
+ *
+ * Everything here is read straight from lawyer_profiles and accounts — the same
+ * rows the public directory and the admin portal read — so a change made here
+ * shows up in both without anything needing to be copied across.
+ *
+ * MUST be registered before GET /:slug, or "settings" is read as a slug.
+ */
+router.get('/settings', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (user.role !== 'lawyer') return res.status(403).json({ error: 'Not a lawyer account' })
+
+    const { data, error } = await supabase
+      .from('lawyer_profiles').select('*').eq('account_id', user.id).maybeSingle()
+    if (error) throw error
+    if (!data) return res.status(404).json({ error: 'Complete onboarding first' })
+
+    const { data: bank } = await supabase
+      .from('lawyer_bank_details')
+      .select('account_holder_name, ifsc_code, bank_name')
+      .eq('account_id', user.id)
+      .maybeSingle()
+
+    return res.json({
+      firstName:            data.first_name ?? '',
+      lastName:             data.last_name ?? '',
+      bio:                  data.bio ?? null,
+      firmName:             data.firm_name ?? null,
+      profilePhotoUrl:      data.profile_photo_url ?? null,
+      languages:            data.languages ?? [],
+      courtsPracticed:      data.courts_practiced ?? [],
+      linkedinUrl:          data.linkedin_url ?? null,
+      websiteUrl:           data.website_url ?? null,
+      draftingEnabled:      (data.document_services ?? []).includes('drafting'),
+      verificationEnabled:  (data.document_services ?? []).includes('verification'),
+      consultationEnabled:  (data.consultation_types ?? []).length > 0,
+      consultationTypes:    data.consultation_types ?? [],
+      // Three rates, because the client pays a different price per channel and
+      // the booking widget has always shown them separately.
+      // 25, not 20: the settings form enforces a ₹25/min floor, so a fallback
+      // of 20 produced a value the form immediately rejected — disabling Save
+      // for any lawyer who had never set a rate, with nothing on screen to
+      // explain why the button did nothing.
+      feeChat:              Number(data.consultation_fee_chat)  || 25,
+      feeVoice:             Number(data.consultation_fee_voice) || 30,
+      feeVideo:             Number(data.consultation_fee_video) || 40,
+      bankAccountName:      bank?.account_holder_name ?? null,
+      bankIfsc:             bank?.ifsc_code ?? null,
+      bankName:             bank?.bank_name ?? null,
+      upiId:                data.upi_id ?? null,
+      gstNumber:            data.gst_number ?? null,
+      panNumber:            data.pan_number ?? null,
+    })
+  } catch (err) {
+    console.error('[lawyers/settings GET]', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── PATCH /api/lawyers/settings ──────────────────────────────────────────────
+/**
+ * Only the fields present in the body are written, so the form can send a
+ * partial update without blanking everything it did not include.
+ *
+ * verification_status is deliberately untouched: a lawyer editing their own
+ * rate or photo is not re-applying, and must not be able to move themselves
+ * through the approval queue.
+ */
+router.patch('/settings', validateBody(lawyerSettingsUpdateSchema), async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (user.role !== 'lawyer') return res.status(403).json({ error: 'Not a lawyer account' })
+
+    const b = req.body as Record<string, unknown>
+    const update: Record<string, unknown> = { updated_at: new Date().toISOString() }
+
+    const map: [string, string][] = [
+      ['firstName', 'first_name'], ['lastName', 'last_name'],
+      ['bio', 'bio'], ['firmName', 'firm_name'],
+      ['profilePhotoUrl', 'profile_photo_url'],
+      ['languages', 'languages'], ['courtsPracticed', 'courts_practiced'],
+      ['linkedinUrl', 'linkedin_url'], ['websiteUrl', 'website_url'],
+      ['consultationTypes', 'consultation_types'],
+      ['feeChat', 'consultation_fee_chat'],
+      ['feeVoice', 'consultation_fee_voice'],
+      ['feeVideo', 'consultation_fee_video'],
+      ['upiId', 'upi_id'], ['gstNumber', 'gst_number'], ['panNumber', 'pan_number'],
+    ]
+    for (const [from, to] of map) {
+      if (b[from] !== undefined) update[to] = b[from]
+    }
+
+    if (b.draftingEnabled !== undefined || b.verificationEnabled !== undefined) {
+      const services: string[] = []
+      if (b.draftingEnabled) services.push('drafting')
+      if (b.verificationEnabled) services.push('verification')
+      update.document_services = services
+    }
+
+    const { error } = await supabase
+      .from('lawyer_profiles').update(update).eq('account_id', user.id)
+    if (error) throw error
+
+    // Bank details live in their own table, keyed by account. Upserted rather
+    // than updated so a lawyer entering payout details for the first time
+    // creates the row instead of writing to nothing.
+    const bankTouched =
+      b.bankAccountName !== undefined ||
+      b.bankAccountNumber !== undefined ||
+      b.bankIfsc !== undefined
+
+    if (bankTouched) {
+      const { data: existing } = await supabase
+        .from('lawyer_bank_details').select('account_id').eq('account_id', user.id).maybeSingle()
+
+      const bankRow: Record<string, unknown> = { account_id: user.id }
+      if (b.bankAccountName !== undefined) bankRow.account_holder_name = b.bankAccountName
+      if (b.bankIfsc !== undefined) bankRow.ifsc_code = b.bankIfsc
+      // The account number is deliberately not written here. The column is
+      // account_number_enc — encrypted — and there is no encryption helper in
+      // this codebase, so writing the plaintext the form collects would put a
+      // bank account number in the clear under a name that says otherwise.
+      // It is captured during onboarding; changing it stays a support request
+      // until that encryption exists.
+
+      const { error: bankErr } = existing
+        ? await supabase.from('lawyer_bank_details').update(bankRow).eq('account_id', user.id)
+        : await supabase.from('lawyer_bank_details').insert(bankRow)
+
+      if (bankErr) {
+        console.error('[lawyers/settings PATCH] bank details', bankErr)
+        return res.status(500).json({ error: 'Profile saved, but payout details could not be updated.' })
+      }
+    }
+
+    // The display name lives in two places — the profile row the directory
+    // reads and the account row the portal greets them by. Leaving one behind
+    // renames them on the public site but not in their own header.
+    if (b.firstName !== undefined || b.lastName !== undefined) {
+      const nameUpdate: Record<string, unknown> = {}
+      if (b.firstName !== undefined) nameUpdate.first_name = b.firstName
+      if (b.lastName !== undefined) nameUpdate.last_name = b.lastName
+      await supabase.from('accounts').update(nameUpdate).eq('id', user.id)
+    }
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('[lawyers/settings PATCH]', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── GET /api/lawyers/:slug/photo ─────────────────────────────────────────────
+/**
+ * Redirects to a freshly signed URL for the lawyer's profile photo.
+ *
+ * profile_photo_url holds a storage path, not a link: uploads go to the private
+ * legalx-lawyer-docs bucket, which a browser cannot read. Handing that path to
+ * an <img> is why an uploaded photo never appeared and the page kept showing
+ * initials.
+ *
+ * Signed on demand rather than stored, because a signed URL expires and a
+ * profile photo has to keep working. Public by design — this is the picture the
+ * directory shows — so no auth, but it only ever resolves the photo column and
+ * nothing else in the bucket.
+ */
+router.get('/:slug/photo', async (req: Request, res: Response) => {
+  try {
+    const { data } = await supabase
+      .from('lawyer_profiles')
+      .select('profile_photo_url')
+      .eq('account_id', String(req.params.slug))
+      .maybeSingle()
+
+    const path = data?.profile_photo_url
+    if (!path) return res.status(404).json({ error: 'No photo' })
+
+    // Already a full URL (an older record, or an external avatar) — pass it on.
+    if (/^https?:\/\//i.test(path)) return res.redirect(302, path)
+
+    const { data: signed, error } = await supabase.storage
+      .from('legalx-lawyer-docs')
+      .createSignedUrl(path, 3600)
+
+    if (error || !signed?.signedUrl) {
+      console.error('[lawyers/photo] sign failed', error)
+      return res.status(404).json({ error: 'No photo' })
+    }
+
+    // Shorter than the signature's own life, so a cached redirect can never
+    // outlive the URL it points at.
+    res.set('Cache-Control', 'public, max-age=1800')
+    return res.redirect(302, signed.signedUrl)
+  } catch (err) {
+    console.error('[lawyers/photo]', err)
+    return res.status(404).json({ error: 'No photo' })
   }
 })
 
