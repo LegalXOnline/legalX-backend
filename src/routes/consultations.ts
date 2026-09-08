@@ -5,6 +5,7 @@ import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody } from '../lib/validation'
 import { createNotification } from '../lib/notify'
+import { logger } from '../lib/logger'
 import { z } from 'zod'
 
 const router = Router()
@@ -501,6 +502,109 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     })
   } catch (err) {
     console.error('[consultations/agora-token]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── POST /api/consultations/:id/end ──────────────────────────────────────────
+/**
+ * Ends a consultation from the call screen.
+ *
+ * The room has been calling this since it was written, behind a catch that
+ * shrugged if it 404'd — and it did, because the route never existed. Nothing
+ * recorded the call: no duration, no completion, no charge, and nothing in the
+ * lawyer's Completed tab.
+ *
+ * Settlement was left entirely to Agora's channel-destroy webhook, which is a
+ * poor sole owner of the record. It arrives late, only when the last person
+ * leaves, and only if the console is still pointed at us. Hanging up is the
+ * moment we actually know about, so it is the moment we write.
+ *
+ * Both paths are safe together: charge_consultation_credits() refuses to
+ * charge a consultation twice, and the guards below skip one already
+ * completed, so whichever arrives second changes nothing.
+ */
+router.post('/:id/end', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const id = String(req.params.id)
+    const { data: consultation, error } = await supabase
+      .from('consultations').select('*').eq('id', id).maybeSingle()
+
+    if (error) throw error
+    if (!consultation) { res.status(404).json({ error: 'Consultation not found' }); return }
+
+    if (consultation.client_id !== user.id && consultation.lawyer_id !== user.id) {
+      res.status(403).json({ error: 'You are not a participant in this consultation' }); return
+    }
+
+    // Whoever hangs up second finds it already settled.
+    if (consultation.status === 'completed' || consultation.credits_charged_paise !== null) {
+      res.json({
+        ok: true,
+        alreadySettled: true,
+        durationSeconds: consultation.duration_seconds ?? 0,
+        totalAmount: Number(consultation.total_amount ?? 0),
+      })
+      return
+    }
+
+    const endedAt = new Date()
+    const startedAt = consultation.started_at ? new Date(consultation.started_at) : null
+
+    // started_at is stamped when the lawyer accepts. Without it nobody ever
+    // joined, so this is a missed call: recorded, and free.
+    if (!startedAt) {
+      await supabase.from('consultations').update({
+        status: 'cancelled',
+        ended_at: endedAt.toISOString(),
+        duration_seconds: 0,
+        total_amount: 0,
+        credits_charged_paise: consultation.payment_status === 'credits' ? 0 : null,
+      }).eq('id', id)
+
+      res.json({ ok: true, answered: false, durationSeconds: 0, totalAmount: 0 })
+      return
+    }
+
+    const durationSeconds = Math.max(0, Math.floor((endedAt.getTime() - startedAt.getTime()) / 1000))
+    const feePerMinute = Number(consultation.fee_per_minute)
+    const totalAmount = Math.max(
+      Math.ceil((durationSeconds / 60) * feePerMinute),
+      feePerMinute, // a call that connected bills at least its first minute
+    )
+
+    let creditsChargedPaise: number | null = null
+    if (consultation.payment_status === 'credits') {
+      const { data: charged, error: creditErr } = await supabase.rpc('charge_consultation_credits', {
+        p_consultation_id: id,
+        p_amount_paise: totalAmount * 100,
+      })
+      if (creditErr) {
+        logger.error({ err: creditErr.message, consultationId: id }, '[consultations/end] credit debit failed')
+        res.status(500).json({ error: 'Could not settle this consultation.' }); return
+      }
+      creditsChargedPaise = Number(charged ?? 0)
+    }
+
+    const { error: updateErr } = await supabase.from('consultations').update({
+      status: 'completed',
+      ended_at: endedAt.toISOString(),
+      duration_seconds: durationSeconds,
+      total_amount: totalAmount,
+    }).eq('id', id)
+    if (updateErr) throw updateErr
+
+    logger.info(
+      { consultationId: id, durationSeconds, totalAmount, creditsChargedPaise },
+      '[consultations/end] settled'
+    )
+
+    res.json({ ok: true, answered: true, durationSeconds, totalAmount, creditsChargedPaise })
+  } catch (err) {
+    console.error('[consultations/end]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })
