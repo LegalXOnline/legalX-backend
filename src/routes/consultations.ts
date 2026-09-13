@@ -320,20 +320,12 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
     if (consultation.client_id !== user.id) { res.status(403).json({ error: 'Not your consultation' }); return }
     if (consultation.status !== 'pending') { res.status(400).json({ error: 'Consultation not in pending state' }); return }
 
-    // ── TEST MODE: bypass Razorpay verification for test_payment_* IDs ────────
-    // Remove this block before going to production.
-    const isTestPayment = razorpayPaymentId.startsWith('test_payment_')
-    if (!isTestPayment) {
-      // Verify Razorpay payment is authorized (production flow)
-      const payment = await razorpay.payments.fetch(razorpayPaymentId) as any
-      if (payment.order_id !== consultation.razorpay_order_id) {
-        res.status(400).json({ error: 'Payment does not match consultation' }); return
-      }
-      if (payment.status !== 'authorized') {
-        res.status(400).json({ error: 'Payment not authorized' }); return
-      }
-    } else {
-      console.info('[consultations/token] TEST MODE — skipping Razorpay verification for:', razorpayPaymentId)
+    const payment = await razorpay.payments.fetch(razorpayPaymentId) as { order_id: string; status: string }
+    if (payment.order_id !== consultation.razorpay_order_id) {
+      res.status(400).json({ error: 'Payment does not match consultation' }); return
+    }
+    if (payment.status !== 'authorized' && payment.status !== 'captured') {
+      res.status(400).json({ error: 'Payment not authorized' }); return
     }
 
     // Agora: channel = consultationId (no server-side room creation needed)
@@ -347,7 +339,7 @@ router.post('/token', validateBody(tokenSchema), async (req: Request, res: Respo
       razorpay_payment_id: razorpayPaymentId,
       hms_room_id: channelName,        // agora channel name = consultationId
       hms_session_id: channelName,     // used for webhook matching
-      payment_status: isTestPayment ? 'test_mode' : 'authorized',
+      payment_status: 'authorized',
     }).eq('id', consultationId)
 
     // Notify lawyer via Supabase Realtime (insert to consultation_notifications)
