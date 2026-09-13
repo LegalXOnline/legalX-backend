@@ -829,7 +829,7 @@ router.post('/:id/end', async (req: Request, res: Response) => {
 async function conversationFor(consultationId: string, userId: string) {
   const { data: consultation } = await supabase
     .from('consultations')
-    .select('id, client_id, lawyer_id, status')
+    .select('id, client_id, lawyer_id, status, started_at, ended_at')
     .eq('id', consultationId)
     .maybeSingle()
 
@@ -902,9 +902,9 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
       conversationId: found.conversationId,
       messages: data ?? [],
       selfId: user.id,
-      // So the other side can tell the difference between a quiet conversation
-      // and one the other person has already closed.
       status: found.consultation.status,
+      startedAt: found.consultation.started_at,
+      endedAt: found.consultation.ended_at,
     })
   } catch (err) {
     console.error('[consultations/messages GET]', err)
@@ -1098,13 +1098,16 @@ router.post('/review', validateBody(reviewSchema), async (req: Request, res: Res
       }
     }
 
-    const { error: insertErr } = await supabase.from('reviews').insert({
+    // One review per client per target, so a second consultation with the same
+    // lawyer updates the existing rating rather than colliding with it. The
+    // unique key made that a 500 the client was told to retry.
+    const { error: insertErr } = await supabase.from('reviews').upsert({
       account_id: user.id,
       target_type: targetType,
       target_id: targetId,
       rating,
       comment: comment || null,
-    })
+    }, { onConflict: 'account_id,target_type,target_id' })
     if (insertErr) throw insertErr
 
     // Recompute the lawyer's rating from all their reviews rather than nudging
