@@ -910,6 +910,9 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
       conversationId: found.conversationId,
       messages: data ?? [],
       selfId: user.id,
+      // So the other side can tell the difference between a quiet conversation
+      // and one the other person has already closed.
+      status: found.consultation.status,
     })
   } catch (err) {
     console.error('[consultations/messages GET]', err)

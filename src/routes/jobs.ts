@@ -1,9 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import crypto from 'crypto'
 import { logger } from '../lib/logger'
-import { runIngest } from '../lib/shortsPipeline'
-import { FEED_SOURCES } from '../lib/sources/rss'
 import { supabase } from '../lib/supabase'
+import { FEED_SOURCES } from '../lib/sources/rss'
 
 const router = Router()
 
@@ -38,32 +37,6 @@ function requireJobSecret(req: Request, res: Response, next: NextFunction) {
 
   next()
 }
-
-// ── POST /api/jobs/shorts-daily ──────────────────────────────────────────────
-// Run by the scheduled workflow once a day. Proposes a batch of suggestions
-// from the enabled feeds for an editor to curate.
-//
-// Cards are created pending. Nothing reaches the public feed without a human
-// approving it in the admin portal.
-router.post('/shorts-daily', requireJobSecret, async (req: Request, res: Response) => {
-  // Propose more than will be published — the editor keeps the best few.
-  const target = Math.min(Math.max(Number(req.body?.target) || 8, 1), 20)
-
-  try {
-    const report = await runIngest({ target, feeds: req.body?.feeds })
-    logger.info(
-      { proposed: report.proposed, skipped: report.skipped.length, failed: report.failed.length },
-      '[jobs] shorts-daily complete'
-    )
-    res.json(report)
-  } catch (err: any) {
-    const message = err?.message ?? 'unknown'
-    logger.error({ err: message }, '[jobs] shorts-daily failed')
-    // 5xx so the scheduled run is marked failed and someone notices, rather
-    // than the feed quietly going stale for a week.
-    res.status(500).json({ error: message })
-  }
-})
 
 // ── POST /api/jobs/retention ─────────────────────────────────────────────────
 // Housekeeping. Supabase's free tier is 500 MB and three tables grow without
