@@ -129,6 +129,29 @@ router.patch(
   },
 )
 
+/**
+ * GET /api/profile/photo
+ *
+ * Redirects to a freshly signed URL, the same way lawyer photos are served.
+ * A stable path means a client can put it straight in an <img> and never deal
+ * with an hour-old signature going stale mid-session.
+ */
+router.get('/photo', requireAuth, async (req: AuthedRequest, res: Response) => {
+  const { data } = await supabase
+    .from('accounts')
+    .select('avatar_url')
+    .eq('id', req.user!.id)
+    .maybeSingle()
+
+  const path = data?.avatar_url
+  if (!path) return res.status(404).json({ error: 'No photo' })
+  if (/^https?:\/\//i.test(path)) return res.redirect(302, path)
+
+  const signed = await signAvatar(path)
+  if (!signed) return res.status(404).json({ error: 'No photo' })
+  return res.redirect(302, signed)
+})
+
 // ── POST /api/profile/photo ──────────────────────────────────────────────────
 // Multipart, so it cannot share the JSON route above.
 router.post('/photo', requireAuth, upload.single('file'), async (req: AuthedRequest, res: Response) => {

@@ -477,7 +477,7 @@ router.get('/me', async (req: Request, res: Response) => {
     // Read role from accounts table — single source of truth
     const { data: account } = await supabase
       .from('accounts')
-      .select('role, first_name, last_name, status, free_credit_paise')
+      .select('role, first_name, last_name, status, free_credit_paise, avatar_url')
       .eq('id', u.id)
       .single()
 
@@ -501,6 +501,9 @@ router.get('/me', async (req: Request, res: Response) => {
         // Carried here so the booking widget can show what is actually left
         // rather than the flat "₹100 to start" it used to print regardless.
         freeCreditPaise: Number(account.free_credit_paise ?? 0),
+        // A path, not a signed URL: signing on every session check would add a
+        // storage round trip to the hottest endpoint on the site.
+        avatarUrl: account.avatar_url ? '/api/profile/photo' : null,
       },
     })
   } catch {
