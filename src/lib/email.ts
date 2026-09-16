@@ -961,3 +961,67 @@ export async function sendClientApplicationConfirmation(opts: {
 }
 
 
+
+
+/**
+ * Admin alert when a client attaches a document.
+ *
+ * Carries a signed link rather than a bare path: the bucket is private, so a
+ * path in an inbox is only useful to somebody who already has the console
+ * open. The link expires, which is why the storage path is included too — it
+ * is what the admin panel resolves against later.
+ */
+export async function sendDocumentUploadedAlert(opts: {
+  clientName: string
+  clientEmail?: string
+  serviceTitle: string
+  docType: string
+  fileName: string
+  storagePath: string
+  signedUrl?: string | null
+  expiresInHours?: number
+}) {
+  const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+  const hours = opts.expiresInHours ?? 24
+
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: ADMIN,
+      subject: `📎 ${opts.docType} uploaded — ${opts.clientName} (${opts.serviceTitle})`,
+      html: `
+        <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 6px;color:#111;font-size:20px">📎 Client document uploaded</h2>
+          <p style="margin:0 0 20px;color:#888;font-size:13px">${timestamp} IST</p>
+
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr><td style="padding:8px 0;color:#888;width:120px">Client</td><td style="padding:8px 0;color:#111">${escapeHtml(opts.clientName)}</td></tr>
+            ${opts.clientEmail ? `<tr><td style="padding:8px 0;color:#888">Email</td><td style="padding:8px 0;color:#111">${escapeHtml(opts.clientEmail)}</td></tr>` : ''}
+            <tr><td style="padding:8px 0;color:#888">Service</td><td style="padding:8px 0;color:#111">${escapeHtml(opts.serviceTitle)}</td></tr>
+            <tr><td style="padding:8px 0;color:#888">Document</td><td style="padding:8px 0;color:#111">${escapeHtml(opts.docType)}</td></tr>
+            <tr><td style="padding:8px 0;color:#888">File</td><td style="padding:8px 0;color:#111">${escapeHtml(opts.fileName)}</td></tr>
+          </table>
+
+          ${opts.signedUrl ? `
+          <div style="margin:24px 0">
+            <a href="${opts.signedUrl}"
+               style="display:inline-block;background:#C9A227;color:#000;text-decoration:none;
+                      font-weight:600;padding:12px 22px;border-radius:8px;font-size:14px">
+              Open the document
+            </a>
+            <p style="margin:10px 0 0;color:#888;font-size:12px">
+              This link expires in ${hours} hours. After that, open it from the admin panel.
+            </p>
+          </div>` : ''}
+
+          <p style="margin:20px 0 0;color:#888;font-size:12px">
+            Stored privately at
+            <code style="color:#555;font-size:12px">legalx-client-docs/${escapeHtml(opts.storagePath)}</code>
+          </p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] document uploaded alert failed:', err)
+  }
+}

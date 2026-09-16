@@ -685,7 +685,7 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     const consultationId = String(req.params.id)
     const { data: consultation, error } = await supabase
       .from('consultations')
-      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at, fee_per_minute')
+      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at, ended_at, fee_per_minute')
       .eq('id', consultationId)
       .single()
 
@@ -768,6 +768,12 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       counterpartId,
       counterpartName,
       feePerMinute: Number(consultation.fee_per_minute) || null,
+      // The billing clock, from the server. started_at is stamped when the
+      // lawyer accepts, so a client sitting in an unanswered room has nothing
+      // to count from and is charged nothing. A device clock would disagree
+      // between the two sides and bill for time nobody spent talking.
+      startedAt: consultation.started_at ?? null,
+      endedAt: consultation.ended_at ?? null,
     })
   } catch (err) {
     console.error('[consultations/agora-token]', err)
