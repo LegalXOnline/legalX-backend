@@ -40,8 +40,14 @@ export interface PushPayload {
   url?: string
   /** Groups replacements: a second ring for one call replaces the first. */
   tag?: string
-  /** Set for a call so the worker can present it as urgent rather than routine. */
-  kind?: 'call' | 'info'
+  /**
+   * How loudly to present it.
+   *
+   *  call    a ring: highest importance, its own channel, full-screen intent
+   *  message a chat message: audible, but it does not take over the screen
+   *  info    everything else: silent, read when convenient
+   */
+  kind?: 'call' | 'message' | 'info'
 }
 
 /**
@@ -139,10 +145,12 @@ export async function sendDevicePushToAccount(
     title: payload.title,
     body: payload.body,
     data: { url: payload.url ?? null, kind: payload.kind ?? 'info' },
-    // A ring has to cut through a silent phone; an update does not.
-    priority: payload.kind === 'call' ? 'high' : 'normal',
-    sound: payload.kind === 'call' ? 'default' : null,
-    channelId: payload.kind === 'call' ? 'calls' : 'default',
+    // A ring has to cut through a silent phone. A message should be heard but
+    // not take over the screen. Everything else can wait to be read.
+    priority: payload.kind === 'call' || payload.kind === 'message' ? 'high' : 'normal',
+    sound: payload.kind === 'call' || payload.kind === 'message' ? 'default' : null,
+    channelId:
+      payload.kind === 'call' ? 'calls' : payload.kind === 'message' ? 'messages' : 'default',
   }))
 
   try {

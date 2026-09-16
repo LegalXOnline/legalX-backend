@@ -967,6 +967,9 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
       body: content?.slice(0, 120) || (attachmentName ? `Sent ${attachmentName}` : 'Sent a document'),
       url: `/consultation/${consultationId}`,
       tag: `chat-${consultationId}`,
+      // Audible. A message that arrives in silence is one the other side finds
+      // ten minutes later, which in a paid consultation is the same as lost.
+      kind: 'message',
     }).catch(() => { /* the message is saved either way */ })
 
     res.status(201).json({ message })
