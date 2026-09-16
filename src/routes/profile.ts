@@ -1,16 +1,36 @@
 import { Router, Request, Response, NextFunction } from 'express'
+import multer from 'multer'
+import { createClient } from '@supabase/supabase-js'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody, profileUpdateSchema } from '../lib/validation'
 
 const router = Router()
 
-/**
- * The signed-in account.
- *
- * Same cookie-or-bearer pattern the payment routes use, so the mobile client
- * and the web client both reach this with the credential each already holds.
- */
-async function requireAuth(req: Request, res: Response, next: NextFunction) {
+const AVATAR_BUCKET = 'legalx-client-avatars'
+const SIGNED_URL_TTL = 60 * 60
+
+/** Service-role client for storage. Never scoped to a user JWT. */
+const storageClient = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { persistSession: false, autoRefreshToken: false } },
+)
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp']
+    if (allowed.includes(file.mimetype)) return cb(null, true)
+    cb(new Error('Profile photos must be JPG, PNG or WebP'))
+  },
+})
+
+interface AuthedRequest extends Request {
+  user?: { id: string; email: string }
+}
+
+async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
     const token = req.cookies?.lx_access_token || req.headers.authorization?.replace('Bearer ', '')
     if (!token) return res.status(401).json({ error: 'Not authenticated' })
@@ -18,42 +38,78 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
     const { data, error } = await supabaseAuthValidator.auth.getUser(token)
     if (error || !data.user) return res.status(401).json({ error: 'Invalid or expired session' })
 
-    ;(req as Request & { user?: { id: string } }).user = { id: data.user.id }
+    req.user = { id: data.user.id, email: data.user.email ?? '' }
     next()
   } catch {
     return res.status(401).json({ error: 'Unauthorized' })
   }
 }
 
-/**
- * PATCH /api/profile
- *
- * Writes to accounts, not a profiles table — accounts is where first_name,
- * last_name actually live. Role, status and email are not
- * editable here by design: those are decided elsewhere, and accepting them
- * would make this endpoint a privilege escalation.
- */
+/** The stored path signed for reading, or null. The bucket is private. */
+async function signAvatar(path: string | null): Promise<string | null> {
+  if (!path) return null
+  const { data } = await storageClient.storage.from(AVATAR_BUCKET).createSignedUrl(path, SIGNED_URL_TTL)
+  return data?.signedUrl ?? null
+}
+
+// ── GET /api/profile ─────────────────────────────────────────────────────────
+// /api/auth/me carries only what the session needs. This is the whole record
+// the profile screen renders, photo included.
+router.get('/', requireAuth, async (req: AuthedRequest, res: Response, next: NextFunction) => {
+  try {
+    const { data, error } = await supabase
+      .from('accounts')
+      .select('first_name, last_name, email, phone, avatar_url')
+      .eq('id', req.user!.id)
+      .single()
+
+    if (error || !data) return res.status(404).json({ error: 'Profile not found' })
+
+    return res.json({
+      profile: {
+        firstName: data.first_name ?? '',
+        lastName: data.last_name ?? '',
+        email: data.email ?? req.user!.email,
+        phone: data.phone ?? '',
+        avatarUrl: await signAvatar(data.avatar_url),
+      },
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── PATCH /api/profile ───────────────────────────────────────────────────────
 router.patch(
   '/',
   requireAuth,
   validateBody(profileUpdateSchema),
-  async (req: Request, res: Response, next: NextFunction) => {
+  async (req: AuthedRequest, res: Response, next: NextFunction) => {
     try {
-      const userId = (req as Request & { user?: { id: string } }).user!.id
-      const { firstName, lastName } = req.body as { firstName?: string; lastName?: string }
+      const { firstName, lastName, phone } = req.body as {
+        firstName?: string
+        lastName?: string
+        phone?: string
+      }
 
       const patch: Record<string, string> = {}
       if (firstName !== undefined) patch.first_name = firstName
       if (lastName !== undefined) patch.last_name = lastName
+      if (phone !== undefined) patch.phone = phone
 
       const { data, error } = await supabase
         .from('accounts')
         .update(patch)
-        .eq('id', userId)
-        .select('first_name, last_name')
+        .eq('id', req.user!.id)
+        .select('first_name, last_name, email, phone, avatar_url')
         .single()
 
       if (error) {
+        // phone is UNIQUE on accounts, so a number already in use comes back
+        // as a constraint violation rather than a validation failure.
+        if (error.code === '23505') {
+          return res.status(409).json({ error: 'That mobile number is already on another account' })
+        }
         console.error('[profile] update failed:', error.message)
         return res.status(500).json({ error: 'Could not save your profile' })
       }
@@ -62,6 +118,9 @@ router.patch(
         profile: {
           firstName: data.first_name ?? '',
           lastName: data.last_name ?? '',
+          email: data.email ?? req.user!.email,
+          phone: data.phone ?? '',
+          avatarUrl: await signAvatar(data.avatar_url),
         },
       })
     } catch (err) {
@@ -69,5 +128,56 @@ router.patch(
     }
   },
 )
+
+// ── POST /api/profile/photo ──────────────────────────────────────────────────
+// Multipart, so it cannot share the JSON route above.
+router.post('/photo', requireAuth, upload.single('file'), async (req: AuthedRequest, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' })
+
+    const ext = req.file.mimetype === 'image/png' ? 'png'
+      : req.file.mimetype === 'image/webp' ? 'webp' : 'jpg'
+    const path = `${req.user!.id}/avatar-${Date.now()}.${ext}`
+
+    const { error: uploadError } = await storageClient.storage
+      .from(AVATAR_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false })
+
+    if (uploadError) {
+      console.error('[profile/photo] storage error:', uploadError.message)
+      return res.status(500).json({ error: 'Upload failed. Please try again.' })
+    }
+
+    const { data: previous } = await supabase
+      .from('accounts')
+      .select('avatar_url')
+      .eq('id', req.user!.id)
+      .maybeSingle()
+
+    const { error: saveError } = await supabase
+      .from('accounts')
+      .update({ avatar_url: path })
+      .eq('id', req.user!.id)
+
+    if (saveError) {
+      console.error('[profile/photo] save failed:', saveError.message)
+      return res.status(500).json({ error: 'Could not save your photo' })
+    }
+
+    // The old file is now unreachable; leaving it would grow the bucket with
+    // every change. Best-effort: the new photo is already saved.
+    if (previous?.avatar_url && previous.avatar_url !== path) {
+      void storageClient.storage.from(AVATAR_BUCKET).remove([previous.avatar_url])
+    }
+
+    return res.json({ avatarUrl: await signAvatar(path) })
+  } catch (err) {
+    const e = err as { message?: string; code?: string }
+    if (e.message?.includes('Profile photos must be')) return res.status(400).json({ error: e.message })
+    if (e.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Photo too large. Maximum 3 MB.' })
+    console.error('[profile/photo] unexpected:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
 
 export default router

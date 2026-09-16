@@ -451,13 +451,20 @@ export function validateQuery<T extends z.ZodType>(schema: T) {
 /**
  * Client profile edit.
  *
- * Name only. There is no avatar upload endpoint, so accepting an avatar path
- * here would take a value nothing can produce.
+ * Role, status and email are absent on purpose: they are decided elsewhere,
+ * and accepting them here would turn this into a way to escalate a role. The
+ * photo has its own endpoint because it is multipart.
  */
 export const profileUpdateSchema = z.object({
   firstName: z.string().min(1, 'First name is required').max(50).trim().optional(),
   lastName: z.string().min(1, 'Last name is required').max(50).trim().optional(),
+  phone: z
+    .string()
+    .trim()
+    .transform(v => v.replace(/[\s-]/g, '').replace(/^\+91/, ''))
+    .pipe(z.string().regex(/^[6-9]\d{9}$/, 'Enter a 10-digit Indian mobile number'))
+    .optional(),
 }).refine(
-  v => v.firstName !== undefined || v.lastName !== undefined,
+  v => v.firstName !== undefined || v.lastName !== undefined || v.phone !== undefined,
   { message: 'Nothing to update' },
 )
