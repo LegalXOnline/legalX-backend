@@ -447,3 +447,17 @@ export function validateQuery<T extends z.ZodType>(schema: T) {
     next()
   }
 }
+
+/**
+ * Client profile edit.
+ *
+ * Name only. There is no avatar upload endpoint, so accepting an avatar path
+ * here would take a value nothing can produce.
+ */
+export const profileUpdateSchema = z.object({
+  firstName: z.string().min(1, 'First name is required').max(50).trim().optional(),
+  lastName: z.string().min(1, 'Last name is required').max(50).trim().optional(),
+}).refine(
+  v => v.firstName !== undefined || v.lastName !== undefined,
+  { message: 'Nothing to update' },
+)
