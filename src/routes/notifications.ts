@@ -6,6 +6,7 @@ import {
   validateParams, validateQuery, validateBody,
   uuidParamSchema, adminListQuerySchema,
   pushSubscribeSchema, pushUnsubscribeSchema,
+  deviceTokenSchema, deviceTokenUnregisterSchema,
 } from '../lib/validation'
 import { vapidPublicKey, pushConfigured } from '../lib/push'
 
@@ -268,6 +269,60 @@ router.patch('/read-all', async (req: Request, res: Response, next: NextFunction
   } catch (err) {
     next(err)
   }
+})
+
+/**
+ * POST /api/notifications/device/register
+ *
+ * The app hands over the token its platform issued. Upserted on the token
+ * rather than the account, because one person may have a phone and a tablet
+ * and both should ring.
+ */
+router.post('/device/register', validateBody(deviceTokenSchema), async (req: Request, res: Response) => {
+  const user = await getUser(req)
+  if (!user) return res.status(401).json({ error: 'Not authenticated' })
+
+  const { token, platform, deviceName } = req.body as {
+    token: string
+    platform: 'ios' | 'android'
+    deviceName?: string
+  }
+
+  const { error } = await supabase
+    .from('device_push_tokens')
+    .upsert(
+      {
+        account_id: user.id,
+        token,
+        platform,
+        device_name: deviceName ?? null,
+        last_used_at: new Date().toISOString(),
+      },
+      { onConflict: 'token' },
+    )
+
+  if (error) {
+    logger.error({ err: error.message }, '[push] device register failed')
+    return res.status(500).json({ error: 'Could not register this device' })
+  }
+
+  return res.json({ ok: true })
+})
+
+// ── POST /api/notifications/device/unregister ────────────────────────────────
+// Called on sign-out, so the next person to use the phone is not rung for
+// somebody else's consultations.
+router.post('/device/unregister', validateBody(deviceTokenUnregisterSchema), async (req: Request, res: Response) => {
+  const user = await getUser(req)
+  if (!user) return res.status(401).json({ error: 'Not authenticated' })
+
+  await supabase
+    .from('device_push_tokens')
+    .delete()
+    .eq('account_id', user.id)
+    .eq('token', (req.body as { token: string }).token)
+
+  return res.json({ ok: true })
 })
 
 export default router

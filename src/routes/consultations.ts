@@ -6,7 +6,7 @@ import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody, messageSendSchema } from '../lib/validation'
 import { createNotification } from '../lib/notify'
 import { logger } from '../lib/logger'
-import { sendPushToAccount } from '../lib/push'
+import { notifyAllDevices } from '../lib/push'
 import { z } from 'zod'
 
 const router = Router()
@@ -209,7 +209,7 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
       // a tab open; this is what reaches a phone in a pocket. Deliberately not
       // awaited — a push that is slow, or a device that has gone away, must not
       // delay the response the caller is waiting on.
-      void sendPushToAccount(lawyerId, {
+      void notifyAllDevices(lawyerId, {
         title: `Incoming ${type} consultation`,
         body: 'A client is calling now. Tap to answer.',
         url: `/consultation/${consultation.id}`,
@@ -962,7 +962,7 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
       ? found.consultation.lawyer_id
       : found.consultation.client_id
 
-    void sendPushToAccount(other, {
+    void notifyAllDevices(other, {
       title: 'New message',
       body: content?.slice(0, 120) || (attachmentName ? `Sent ${attachmentName}` : 'Sent a document'),
       url: `/consultation/${consultationId}`,

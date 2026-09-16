@@ -468,3 +468,19 @@ export const profileUpdateSchema = z.object({
   v => v.firstName !== undefined || v.lastName !== undefined || v.phone !== undefined,
   { message: 'Nothing to update' },
 )
+
+/**
+ * A native push token.
+ *
+ * Expo tokens look like ExponentPushToken[xxx] or ExpoPushToken[xxx]; the
+ * shape is checked so a stray string cannot fill the table.
+ */
+export const deviceTokenSchema = z.object({
+  token: z.string().min(10).max(255).regex(/^Exp(o|onent)PushToken\[[^\]]+\]$/, 'Not a valid push token'),
+  platform: z.enum(['ios', 'android']),
+  deviceName: z.string().max(120).optional(),
+})
+
+export const deviceTokenUnregisterSchema = z.object({
+  token: z.string().min(10).max(255),
+})
