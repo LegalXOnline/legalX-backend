@@ -12,6 +12,8 @@ import { startKeepAlive } from './lib/keepAlive'
 import leadsRouter from './routes/leads'
 import applicationsRouter from './routes/applications'
 import paymentRouter from './routes/payment'
+import profileRouter from './routes/profile'
+import servicesRouter from './routes/services'
 import walletRouter from './routes/wallet'
 import authRouter from './routes/auth'
 import lawyersRouter from './routes/lawyers'
@@ -235,6 +237,8 @@ app.use('/api/notifications', validateCsrf, notificationsRouter)
 // Phase 1.2: Auth endpoints get a stricter rate limit
 app.use('/api/auth', authRouter)
 app.use('/api/lawyers', lawyersRouter)
+// Static catalogue, read-only and public — no CSRF gate, nothing to forge.
+app.use('/api/services', servicesRouter)
 app.use('/api/contact', contactRouter)
 
 // Public legal-shorts feed — read-only, no auth, safe to cache at the edge.
@@ -252,6 +256,7 @@ app.use('/api/jobs', jobsRouter)
 app.use('/api/leads', validateCsrf, leadsRouter)
 app.use('/api/applications', validateCsrf, applicationsRouter)
 app.use('/api/payment', validateCsrf, paymentRouter)
+app.use('/api/profile', validateCsrf, profileRouter)
 app.use('/api/wallet', validateCsrf, walletRouter)
 app.use('/api/admin', validateCsrf, adminRouter)
 app.use('/api/consultations', validateCsrf, consultationsRouter)
