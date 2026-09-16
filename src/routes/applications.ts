@@ -1,7 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase } from '../lib/supabase'
 import { validateBody, validateParams, applicationCreateSchema, applicationIdParamSchema } from '../lib/validation'
-import { sendDocumentsSubmittedAlert } from '../lib/email'
+import { sendClientApplicationConfirmation, sendDocumentsSubmittedAlert } from '../lib/email'
+import { notifyAdmins } from '../lib/notify'
 
 const router = Router()
 
@@ -39,16 +40,32 @@ router.post('/', validateBody(applicationCreateSchema), async (req: Request, res
     // Mark lead as progressed
     await supabase.from('leads').update({ status: 'contacted' }).eq('id', leadId)
 
-    // Non-blocking: alert admin that documents were submitted but payment not yet done
-    if (lead) {
+    // Everything below is a side-effect of an application that has already
+    // committed. A failed email must not turn a successful submission into an
+    // error, so these are settled and swallowed rather than awaited for status.
+    void Promise.allSettled([
+      // Admin: documents are in, payment is not yet done
       sendDocumentsSubmittedAlert({
         name: lead.name,
         phone: lead.phone,
         email: lead.email,
         serviceTitle: lead.service_title,
         applicationId: data.id,
-      }).catch(() => {}) // fire-and-forget
-    }
+      }),
+      // Client: their own receipt, with the reference to quote back at us
+      sendClientApplicationConfirmation({
+        to: lead.email ?? '',
+        name: lead.name,
+        serviceTitle: lead.service_title,
+        applicationId: data.id,
+      }),
+      notifyAdmins({
+        title: 'New application submitted',
+        message: `${lead.name} submitted ${lead.service_title}.`,
+        type: 'document',
+        link: '/admin/documents',
+      }),
+    ]).catch(() => {})
 
     return res.status(201).json({ applicationId: data.id })
   } catch (err) {

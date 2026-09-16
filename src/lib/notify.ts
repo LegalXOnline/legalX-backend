@@ -61,3 +61,30 @@ export async function createNotifications(inputs: NotificationInput[]): Promise<
     logger.error({ err: error.message, count: rows.length }, 'BULK NOTIFICATION WRITE FAILED')
   }
 }
+
+/**
+ * Every admin account id.
+ *
+ * In-app alerts for client activity have no single recipient the way a
+ * consultation does, so they fan out to whoever is staffing the panel.
+ */
+export async function adminAccountIds(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('accounts')
+    .select('id')
+    .eq('role', 'admin')
+    .eq('status', 'active')
+
+  if (error) {
+    logger.error({ err: error.message }, 'ADMIN LOOKUP FAILED')
+    return []
+  }
+  return (data ?? []).map(row => row.id as string)
+}
+
+/** Writes one notification to every admin. Best-effort, like the rest of this file. */
+export async function notifyAdmins(input: Omit<NotificationInput, 'accountId'>): Promise<void> {
+  const ids = await adminAccountIds()
+  if (!ids.length) return
+  await createNotifications(ids.map(accountId => ({ ...input, accountId })))
+}

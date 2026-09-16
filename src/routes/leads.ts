@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabase } from '../lib/supabase'
 import { sendLeadAlert, sendUserConfirmation } from '../lib/email'
+import { notifyAdmins } from '../lib/notify'
 import { rateLimit } from 'express-rate-limit'
 import crypto from 'crypto'
 import { validateBody, validateParams, leadCreateSchema, leadUpdateBodySchema, leadIdParamSchema } from '../lib/validation'
@@ -66,6 +67,14 @@ router.post('/', leadLimit, validateBody(leadCreateSchema), async (req, res, nex
     // Fire-and-forget emails
     sendLeadAlert({ name: name.trim(), phone, email, serviceTitle })
     if (email) sendUserConfirmation(email, name.trim(), serviceTitle)
+
+    // In-app alert, so the panel shows the lead without waiting on a mailbox
+    void notifyAdmins({
+      title: 'New lead',
+      message: `${name.trim()} enquired about ${serviceTitle}.`,
+      type: 'info',
+      link: '/admin/documents',
+    }).catch(() => {})
 
     return res.status(201).json({ leadId: data.id })
   } catch (err) {

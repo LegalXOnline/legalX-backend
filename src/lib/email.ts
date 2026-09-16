@@ -884,3 +884,80 @@ export async function sendContactFormConfirmation(to: string, name: string) {
     console.error('[email] sendContactFormConfirmation failed:', err)
   }
 }
+
+// ── Client application lifecycle ─────────────────────────────────────────────
+// Three additions for the documents flow: a confirmation to the client when an
+// application is submitted, an admin alert per uploaded document, and a status
+// update for when an order moves. Nothing above is modified.
+
+/** Short, human reference. The full UUID is unusable over the phone. */
+function shortRef(id: string): string {
+  return id.slice(0, 8).toUpperCase()
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/**
+ * Sent to the client the moment an application is submitted, before payment.
+ *
+ * Deliberately states that payment is still outstanding: the previous flow left
+ * people thinking they were done at this point.
+ */
+export async function sendClientApplicationConfirmation(opts: {
+  to: string
+  name: string
+  serviceTitle: string
+  applicationId: string
+}) {
+  if (!opts.to) return
+  const ref = shortRef(opts.applicationId)
+
+  try {
+    await resend.emails.send({
+      from: FROM,
+      to: opts.to,
+      subject: `Application received — ${opts.serviceTitle} (${ref})`,
+      html: `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px">
+          <h2 style="margin:0 0 12px;color:#111">Hi ${escapeHtml(opts.name)},</h2>
+          <p style="color:#555;line-height:1.6">
+            We have received your application for <strong>${escapeHtml(opts.serviceTitle)}</strong>
+            along with your documents.
+          </p>
+
+          <div style="margin:20px 0;padding:16px;background:#fafafa;border-radius:8px">
+            <p style="margin:0 0 4px;color:#888;font-size:12px;letter-spacing:.06em">REFERENCE</p>
+            <p style="margin:0;color:#111;font-size:18px;font-weight:600">${ref}</p>
+          </div>
+
+          <p style="margin:0 0 8px;color:#111;font-weight:600">What happens next</p>
+          <ol style="color:#555;line-height:1.7;padding-left:18px;margin:0 0 20px">
+            <li>Our team reviews your documents, usually within one working day.</li>
+            <li>We come back to you if anything is missing or unclear.</li>
+            <li>Once payment is complete, filing begins and we keep you posted by email.</li>
+          </ol>
+
+          <div style="margin:24px 0;padding:16px;background:#FFF8E6;border-left:4px solid #C9A227">
+            <p style="margin:0;color:#333;font-size:14px">
+              Questions? Reply to this email or write to
+              <a href="mailto:contact@legalxonline.com" style="color:#B08A1E">contact@legalxonline.com</a>
+              quoting <strong>${ref}</strong>.
+            </p>
+          </div>
+
+          <p style="color:#888;font-size:12px;margin-top:32px">LegalX Online · Nandlalpur, Kahalgaon, Bhagalpur, Bihar – 813222</p>
+        </div>
+      `,
+    })
+  } catch (err) {
+    console.error('[email] client application confirmation failed:', err)
+  }
+}
+
+
