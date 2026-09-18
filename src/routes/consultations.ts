@@ -765,26 +765,18 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     }
 
     /**
-     * Asking for a token IS joining — a browser or an app requests credentials
-     * at the moment it enters the room, not when somebody clicked.
+     * Fetching credentials is opening the room, not being in the call.
      *
-     * The clock starts when BOTH sides are in, never on the first arrival.
-     * Stamping started_at when the lawyer appeared meant the client was billed
-     * from that instant while their own join was still running, and billed for
-     * the whole thing if it never completed at all.
+     * Treating it as a join was wrong, and it cost clients money: both sides
+     * request a token the instant the screen opens, so the clock started while
+     * the caller was still on "Connecting..." — and ran for the whole attempt
+     * if the media session never established at all. This records that a side
+     * turned up. POST /:id/media-connected is what says they actually arrived.
      */
     const now = new Date().toISOString()
     const presence: Record<string, string> = {}
     if (isLawyer && !consultation.lawyer_joined_at) presence.lawyer_joined_at = now
     if (isClient && !consultation.client_joined_at) presence.client_joined_at = now
-
-    const lawyerIn = consultation.lawyer_joined_at ?? presence.lawyer_joined_at
-    const clientIn = consultation.client_joined_at ?? presence.client_joined_at
-
-    if (lawyerIn && clientIn && !consultation.started_at) {
-      presence.started_at = now
-      presence.status = 'in_progress'
-    }
 
     if (Object.keys(presence).length) {
       const { error: startErr } = await supabase
@@ -850,6 +842,67 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     })
   } catch (err) {
     console.error('[consultations/agora-token]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── POST /api/consultations/:id/media-connected ──────────────────────────────
+/**
+ * Says the caller is in the media session with the other side present.
+ *
+ * This, not the credential fetch, is what starts the billing clock. A client
+ * whose join never completes reports nothing and is charged nothing, however
+ * long they sat on the connecting screen.
+ *
+ * Idempotent: the call screen may report more than once across a reconnect,
+ * and the first report is the one that counts.
+ */
+router.post('/:id/media-connected', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) { res.status(401).json({ error: 'Not authenticated' }); return }
+
+    const id = String(req.params.id)
+    const { data: consultation } = await supabase
+      .from('consultations')
+      .select('id, client_id, lawyer_id, status, started_at, lawyer_joined_at, client_joined_at')
+      .eq('id', id)
+      .maybeSingle()
+
+    if (!consultation) { res.status(404).json({ error: 'Consultation not found' }); return }
+
+    const isClient = consultation.client_id === user.id
+    const isLawyer = consultation.lawyer_id === user.id
+    if (!isClient && !isLawyer) {
+      res.status(403).json({ error: 'You are not a participant in this consultation' }); return
+    }
+
+    if (consultation.status === 'completed' || consultation.status === 'cancelled') {
+      res.json({ startedAt: consultation.started_at ?? null }); return
+    }
+
+    // Whoever reports has, by definition, the other side in the channel with
+    // them — so this settles both and there is nothing left to wait for.
+    const now = new Date().toISOString()
+    const update: Record<string, string> = {}
+    if (!consultation.lawyer_joined_at) update.lawyer_joined_at = now
+    if (!consultation.client_joined_at) update.client_joined_at = now
+    if (!consultation.started_at) {
+      update.started_at = now
+      update.status = 'in_progress'
+    }
+
+    if (Object.keys(update).length) {
+      const { error } = await supabase.from('consultations').update(update).eq('id', id)
+      if (error) {
+        logger.error({ err: error.message, consultationId: id }, '[media-connected] could not start clock')
+        res.status(500).json({ error: 'Could not start the consultation clock.' }); return
+      }
+    }
+
+    res.json({ startedAt: consultation.started_at ?? update.started_at ?? now })
+  } catch (err) {
+    console.error('[consultations/media-connected]', err)
     res.status(500).json({ error: 'Internal server error' })
   }
 })
