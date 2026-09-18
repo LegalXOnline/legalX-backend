@@ -1100,6 +1100,16 @@ router.get('/:id/attachment', async (req: Request, res: Response) => {
     if (error || !signed?.signedUrl) { res.status(404).json({ error: 'Not found' }); return }
 
     res.set('Cache-Control', 'private, max-age=1800')
+
+    // A native client cannot follow this redirect: it needs the signed URL
+    // itself to hand to a viewer, and reading a Location header back through
+    // the app's networking stack is not something every runtime exposes.
+    // The browser keeps the redirect, which is what an <img> or <a> needs.
+    if (req.query.format === 'json') {
+      res.json({ url: signed.signedUrl })
+      return
+    }
+
     res.redirect(302, signed.signedUrl)
   } catch (err) {
     console.error('[consultations/attachment]', err)
