@@ -4,7 +4,7 @@ import { RtcTokenBuilder, RtcRole } from 'agora-token'
 import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from '../lib/supabase'
 import { validateBody, messageSendSchema } from '../lib/validation'
-import { createNotification } from '../lib/notify'
+import { createNotifications } from '../lib/notify'
 import { logger } from '../lib/logger'
 import { notifyAllDevices } from '../lib/push'
 import { z } from 'zod'
@@ -419,6 +419,26 @@ export async function settleConsultation(id: string): Promise<{
       credits_charged_paise: consultation.payment_status === 'credits' ? 0 : null,
     }).eq('id', id)
 
+    // Both sides get a record. A call nobody answered leaves no trace anywhere
+    // else, so without this the client cannot tell a missed consultation from
+    // one that never got sent.
+    await createNotifications([
+      {
+        accountId: consultation.client_id,
+        title: 'Consultation not answered',
+        message: 'The advocate did not join. You have not been charged.',
+        type: 'consultation',
+        link: `/consultation/${id}`,
+      },
+      {
+        accountId: consultation.lawyer_id,
+        title: 'Missed consultation',
+        message: 'A client called and the consultation went unanswered.',
+        type: 'consultation',
+        link: `/consultation/${id}`,
+      },
+    ])
+
     return { ok: true, answered: false, durationSeconds: 0, totalAmount: 0, creditsChargedPaise: 0 }
   }
 
@@ -449,6 +469,29 @@ export async function settleConsultation(id: string): Promise<{
     total_amount: totalAmount,
   }).eq('id', id)
   if (updateErr) throw updateErr
+
+  // The receipt. This is the only durable record either side sees of what a
+  // call cost, and it is what a billing dispute gets checked against.
+  const spoken = durationSeconds < 60
+    ? `${durationSeconds}s`
+    : `${Math.floor(durationSeconds / 60)} min ${durationSeconds % 60}s`
+
+  await createNotifications([
+    {
+      accountId: consultation.client_id,
+      title: 'Consultation completed',
+      message: `${spoken} with your advocate. Charged Rs ${totalAmount}.`,
+      type: 'payment',
+      link: `/consultation/${id}`,
+    },
+    {
+      accountId: consultation.lawyer_id,
+      title: 'Consultation completed',
+      message: `${spoken} consultation ended. Rs ${totalAmount} billed.`,
+      type: 'consultation',
+      link: `/consultation/${id}`,
+    },
+  ])
 
   logger.info({ consultationId: id, durationSeconds, totalAmount, creditsChargedPaise }, '[settle] done')
 
@@ -649,13 +692,17 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
 
     await supabase.from('consultations').update({ started_at: new Date().toISOString() }).eq('id', req.params.id)
 
-    await createNotification({
-      accountId: consultation.client_id,
+    // Pushed, not just filed. This is the moment the client has to be in the
+    // room, and a bell entry only reaches somebody already looking at the app.
+    // notifyAllDevices stores its own copy, so there is no second write here.
+    void notifyAllDevices(consultation.client_id, {
       title: 'Your lawyer has joined',
-      message: 'The consultation is starting now.',
+      body: 'The consultation is starting now. Tap to join.',
+      url: `/consultation/${req.params.id}`,
+      tag: `call-${req.params.id}`,
+      kind: 'call',
       type: 'consultation',
-      link: `/consultation/${req.params.id}`,
-    })
+    }).catch(err => logger.warn({ err }, '[accept] join push failed'))
 
     res.json({
       consultationId: req.params.id,
@@ -730,12 +777,13 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       } else {
         consultation.started_at = startedAt
         consultation.status = 'in_progress'
-        await createNotification({
-          accountId: consultation.client_id,
+        void notifyAllDevices(consultation.client_id, {
           title: 'Your lawyer has joined',
-          message: 'The consultation is starting now.',
+          body: 'The consultation is starting now. Tap to join.',
+          url: `/consultation/${consultationId}`,
+          tag: `call-${consultationId}`,
+          kind: 'call',
           type: 'consultation',
-          link: `/consultation/${consultationId}`,
         }).catch(() => { /* the client is already in the room */ })
       }
     }

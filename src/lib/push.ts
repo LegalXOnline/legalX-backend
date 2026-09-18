@@ -1,6 +1,7 @@
 import webpush from 'web-push'
 import { supabase } from './supabase'
 import { logger } from './logger'
+import { createNotification, type NotificationType } from './notify'
 
 /**
  * Web push, driven directly rather than through a vendor SDK.
@@ -48,6 +49,14 @@ export interface PushPayload {
    *  info    everything else: silent, read when convenient
    */
   kind?: 'call' | 'message' | 'info'
+  /**
+   * What the stored copy is filed as. A push is transient — it is gone once
+   * dismissed, and a phone that was off never saw it at all — so every one of
+   * them also lands in the bell, where it can still be read tomorrow.
+   */
+  type?: NotificationType
+  /** Set false where the caller already wrote its own row, to avoid a duplicate. */
+  persist?: boolean
 }
 
 /**
@@ -194,6 +203,15 @@ export async function notifyAllDevices(accountId: string, payload: PushPayload):
   const [web, native] = await Promise.all([
     sendPushToAccount(accountId, payload),
     sendDevicePushToAccount(accountId, payload),
+    payload.persist === false
+      ? Promise.resolve()
+      : createNotification({
+          accountId,
+          title: payload.title,
+          message: payload.body,
+          type: payload.type ?? (payload.kind === 'call' ? 'consultation' : 'info'),
+          link: payload.url ?? null,
+        }),
   ])
   return web + native
 }
