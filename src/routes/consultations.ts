@@ -42,9 +42,19 @@ async function getAuthUser(req: Request): Promise<{ id: string; email: string | 
 // Channel = consultationId (unique per session)
 // uid = numeric hash of userId string (Agora requires uint32)
 function userIdToUid(userId: string): number {
-  // Deterministic numeric UID from UUID string
+  // Deterministic numeric UID from UUID string.
+  //
+  // Agora documents the uid as a uint32, but the Android and iOS SDKs take it
+  // as a signed 32-bit int. Anything above 2^31-1 arrives negative, stops
+  // matching the uid the token was signed for, and the join then fails with no
+  // error on either side — the caller sits on "Connecting..." while the other
+  // end waits for somebody who never appears. Just over half of all accounts
+  // hashed into that range, so it looked intermittent rather than broken.
+  //
+  // 0 is excluded because Agora reads it as "assign me any uid", which would
+  // hand out one the token does not cover.
   const hash = crypto.createHash('md5').update(userId).digest()
-  return hash.readUInt32BE(0)
+  return (hash.readUInt32BE(0) % 2_147_483_646) + 1
 }
 
 /**
@@ -408,8 +418,8 @@ export async function settleConsultation(id: string): Promise<{
   const endedAt = new Date()
   const startedAt = consultation.started_at ? new Date(consultation.started_at) : null
 
-  // started_at is stamped when the lawyer joins. Without it nobody ever did, so
-  // this is a missed call: recorded, and free.
+  // started_at is only stamped once both sides reached the room. Without it
+  // the two never connected, so this is a missed call: recorded, and free.
   if (!startedAt) {
     await supabase.from('consultations').update({
       status: 'cancelled',
@@ -673,7 +683,7 @@ router.get('/incoming', async (req: Request, res: Response) => {
 })
 
 // ── PATCH /api/consultations/:id/accept ──────────────────────────────────────
-// Phase 3.3: Lawyer accepts → gets their room token, marks started_at.
+// Phase 3.3: Lawyer accepts → gets their room token, and is marked present.
 router.patch('/:id/accept', async (req: Request, res: Response) => {
   try {
     const user = await getAuthUser(req)
@@ -690,7 +700,11 @@ router.patch('/:id/accept', async (req: Request, res: Response) => {
     const channelName = consultation.hms_room_id // stored as consultationId
     const lawyerToken = generateAgoraToken(channelName, user.id, 'host')
 
-    await supabase.from('consultations').update({ started_at: new Date().toISOString() }).eq('id', req.params.id)
+    // Presence, not the billing clock. The clock starts in /agora-token once
+    // the client is in the room too.
+    await supabase.from('consultations')
+      .update({ lawyer_joined_at: new Date().toISOString(), status: 'in_progress' })
+      .eq('id', req.params.id)
 
     // Pushed, not just filed. This is the moment the client has to be in the
     // room, and a bell entry only reaches somebody already looking at the app.
@@ -732,7 +746,7 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     const consultationId = String(req.params.id)
     const { data: consultation, error } = await supabase
       .from('consultations')
-      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at, ended_at, fee_per_minute')
+      .select('id, client_id, lawyer_id, status, type, hms_room_id, started_at, ended_at, fee_per_minute, lawyer_joined_at, client_joined_at')
       .eq('id', consultationId)
       .single()
 
@@ -751,41 +765,51 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
     }
 
     /**
-     * The lawyer asking for a token IS the lawyer joining.
+     * Asking for a token IS joining — a browser or an app requests credentials
+     * at the moment it enters the room, not when somebody clicked.
      *
-     * started_at was only ever stamped by PATCH /:id/accept, and nothing in the
-     * frontend has ever called it — the ring banner navigates straight to the
-     * room. So started_at stayed null on every consultation, every call was
-     * settled as one nobody answered, and the Completed tab stayed empty while
-     * two people were talking to each other.
-     *
-     * Stamping it here also makes it truer than the button would: the moment
-     * their browser asks for credentials is the moment they are actually
-     * joining, not the moment they clicked.
+     * The clock starts when BOTH sides are in, never on the first arrival.
+     * Stamping started_at when the lawyer appeared meant the client was billed
+     * from that instant while their own join was still running, and billed for
+     * the whole thing if it never completed at all.
      */
-    if (isLawyer && !consultation.started_at) {
-      const startedAt = new Date().toISOString()
+    const now = new Date().toISOString()
+    const presence: Record<string, string> = {}
+    if (isLawyer && !consultation.lawyer_joined_at) presence.lawyer_joined_at = now
+    if (isClient && !consultation.client_joined_at) presence.client_joined_at = now
+
+    const lawyerIn = consultation.lawyer_joined_at ?? presence.lawyer_joined_at
+    const clientIn = consultation.client_joined_at ?? presence.client_joined_at
+
+    if (lawyerIn && clientIn && !consultation.started_at) {
+      presence.started_at = now
+      presence.status = 'in_progress'
+    }
+
+    if (Object.keys(presence).length) {
       const { error: startErr } = await supabase
-        .from('consultations')
-        .update({ status: 'in_progress', started_at: startedAt })
-        .eq('id', consultationId)
+        .from('consultations').update(presence).eq('id', consultationId)
 
       if (startErr) {
         // Not fatal to the call, but it decides what gets billed, so it is
         // logged loudly rather than swallowed.
-        logger.error({ err: startErr.message, consultationId }, '[agora-token] could not stamp started_at')
+        logger.error({ err: startErr.message, consultationId }, '[agora-token] could not record join')
       } else {
-        consultation.started_at = startedAt
-        consultation.status = 'in_progress'
-        void notifyAllDevices(consultation.client_id, {
-          title: 'Your lawyer has joined',
-          body: 'The consultation is starting now. Tap to join.',
-          url: `/consultation/${consultationId}`,
-          tag: `call-${consultationId}`,
-          kind: 'call',
-          type: 'consultation',
-        }).catch(() => { /* the client is already in the room */ })
+        Object.assign(consultation, presence)
       }
+    }
+
+    // Ring the client once the lawyer is in, whether or not the clock started.
+    // This is what brings a phone in a pocket back to the room.
+    if (isLawyer && presence.lawyer_joined_at) {
+      void notifyAllDevices(consultation.client_id, {
+        title: 'Your lawyer has joined',
+        body: 'The consultation is starting now. Tap to join.',
+        url: `/consultation/${consultationId}`,
+        tag: `call-${consultationId}`,
+        kind: 'call',
+        type: 'consultation',
+      }).catch(() => { /* the client is already in the room */ })
     }
 
     // The lawyer is the host; the client joins as an audience-capable publisher.
@@ -816,10 +840,11 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       counterpartId,
       counterpartName,
       feePerMinute: Number(consultation.fee_per_minute) || null,
-      // The billing clock, from the server. started_at is stamped when the
-      // lawyer accepts, so a client sitting in an unanswered room has nothing
-      // to count from and is charged nothing. A device clock would disagree
-      // between the two sides and bill for time nobody spent talking.
+      // The billing clock, from the server. started_at is stamped only once
+      // both sides are in the room, so a client whose own join is still running
+      // — or never completes — has nothing to count from and pays nothing. A
+      // device clock would disagree between the two sides and bill for time
+      // nobody spent talking.
       startedAt: consultation.started_at ?? null,
       endedAt: consultation.ended_at ?? null,
     })
