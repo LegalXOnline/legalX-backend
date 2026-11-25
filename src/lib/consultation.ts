@@ -196,3 +196,16 @@ export function balanceState(
     exhausted: funded > 0 && secondsRemaining === 0,
   }
 }
+
+// ── Account state ────────────────────────────────────────────────────────────
+
+/**
+ * Whether an account may still use the API. [SEC-05]
+ *
+ * A suspended account kept full access for the life of its token: login and
+ * refresh checked status, no route did. Null is allowed — rows predating the
+ * column have none, and locking those out is a worse bug than the one fixed.
+ */
+export function isUsableAccount(status: string | null | undefined): boolean {
+  return status == null || status === 'active'
+}

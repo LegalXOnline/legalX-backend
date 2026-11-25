@@ -1,4 +1,4 @@
-import { isProduction, isDevelopment } from './lib/env'
+import { isProduction, isDevelopment, isAllowedOrigin } from './lib/env'
 import 'dotenv/config'
 import crypto from 'crypto'
 import express from 'express'
@@ -143,22 +143,18 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }))
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim())
+// One allowlist, shared with lib/env.ts so CORS and redirect validation can
+// never disagree about who is trusted. [SEC-02]
 app.use(cors({
   origin: (origin, cb) => {
-    // allow curl / server-side calls (no origin header)
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true)
-    // Allow vercel, netlify, and legalxonline domains in production
-    if (isProduction && (
-      origin.endsWith('.vercel.app') || 
-      origin.endsWith('.netlify.app') ||
-      origin === 'https://legalxonline.com' ||
-      origin === 'https://www.legalxonline.com' ||
-      origin.endsWith('.legalxonline.com')
-    )) {
-      return cb(null, true)
-    }
-    cb(new Error(`CORS: ${origin} not allowed`))
+    // No Origin header: curl and server-to-server, which carry no cookies.
+    if (!origin) return cb(null, true)
+    if (isAllowedOrigin(origin)) return cb(null, true)
+    // Refused rather than thrown. Throwing reached the global error handler and
+    // answered 500, so an unknown origin looked like the service falling over
+    // in the logs. No ACAO header is what actually blocks the browser.
+    logger.warn({ origin }, 'CORS: origin refused')
+    cb(null, false)
   },
   credentials: true, // Required for cookies to be sent cross-origin
 }))

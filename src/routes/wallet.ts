@@ -147,11 +147,24 @@ router.post('/topup/verify', validateBody(walletTopupVerifySchema), async (req: 
     }
 
     const order = await razorpay.orders.fetch(razorpayOrderId) as unknown as {
-      notes?: { accountId?: string }
+      notes?: { accountId?: string; purpose?: string }
     }
-    if (order.notes?.accountId && order.notes.accountId !== user.id) {
-      // Someone else's order id, replayed. The wallet it would credit is not
-      // the wallet that paid.
+
+    /**
+     * This must be an order we opened as a top-up, for this account. [PAY-03]
+     *
+     * The old check only refused when notes.accountId was present and wrong.
+     * A document-service order carries `userId`, not `accountId`, so it had no
+     * accountId at all and sailed through — meaning a Rs 1,499 service payment
+     * could be replayed here and credited to the wallet as Rs 1,499. One
+     * payment, spent twice.
+     */
+    if (order.notes?.purpose !== 'wallet_topup') {
+      logger.warn({ razorpayOrderId, user: user.id, purpose: order.notes?.purpose }, '[wallet] order is not a top-up')
+      res.status(400).json({ error: 'That payment was not a wallet top-up.' })
+      return
+    }
+    if (order.notes?.accountId !== user.id) {
       logger.warn({ razorpayOrderId, user: user.id }, '[wallet] order belongs to another account')
       res.status(403).json({ error: 'That payment belongs to another account.' })
       return

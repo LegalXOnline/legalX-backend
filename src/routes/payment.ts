@@ -162,6 +162,11 @@ router.post('/verify', requireAuth, async (req: AuthedRequest, res: Response, ne
       return res.status(400).json({ error: 'Invalid payment signature' })
     }
 
+    // A top-up order must not settle a service application either. [PAY-03]
+    // The payments lookup below already scopes this to orders we opened for an
+    // application, so a wallet order simply finds no row — but say so plainly
+    // rather than relying on that as the guard.
+    //
     // The order row is authoritative. Nothing from the body is trusted past
     // the signature check.
     const { data: payment, error: paymentError } = await supabase

@@ -201,9 +201,14 @@ router.patch('/lawyers/:id/suspend', requireAdmin, validateParams(lawyerIdParamS
 
     const { error } = await supabase
       .from('lawyer_profiles')
-      .update({ verification_status: 'suspended', is_online: false, updated_at: new Date().toISOString() })
+      .update({ verification_status: 'suspended', is_online: false, last_seen_at: null, updated_at: new Date().toISOString() })
       .eq('account_id', id)
     if (error) throw error
+
+    // Also on the account, which is what the API gate reads. [SEC-05]
+    // Suspending only the profile left their existing session working on
+    // every route, because nothing outside login looked at the profile.
+    await supabase.from('accounts').update({ status: 'suspended' }).eq('id', id)
 
     await supabase.from('disciplinary_flags').insert({
       lawyer_id: id, type: 'suspension', reason, flagged_by: (req as any).user.id,
@@ -236,6 +241,8 @@ router.patch('/lawyers/:id/reinstate', requireAdmin, validateParams(lawyerIdPara
       .update({ verification_status: 'verified', updated_at: new Date().toISOString() })
       .eq('account_id', id)
     if (error) throw error
+
+    await supabase.from('accounts').update({ status: 'active' }).eq('id', id)
 
     await supabase.from('disciplinary_flags').insert({
       lawyer_id: id, type: 'reinstatement', reason, flagged_by: (req as any).user.id,

@@ -47,6 +47,31 @@ const signupOtpLimiter = rateLimit({
   message: { error: 'Too many OTP requests. Please wait 15 minutes and try again.' },
 })
 
+/**
+ * Login brute-force guard. [SEC-04]
+ *
+ * Keyed on the email, not the IP. Every browser request reaches this service
+ * through the Vercel rewrite, so the backend sees one egress address for the
+ * whole site — an IP-keyed limiter here would lock out every user the moment
+ * anyone mistyped a password five times.
+ *
+ * Only failures count: `skipSuccessfulRequests` means somebody signing in
+ * correctly all day is never throttled, while guesses against one account are.
+ */
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  validate: { xForwardedForHeader: isProduction, keyGeneratorIpFallback: false },
+  keyGenerator: (req) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+    return email ? `login:${email}` : `login-ip:${req.ip ?? 'unknown'}`
+  },
+  message: { error: 'Too many sign-in attempts for this account. Please wait 15 minutes and try again.' },
+})
+
 // ── OTP brute-force guard ─────────────────────────────────────────────────────
 // The IP limiter above does not stop an attacker rotating IPs against one
 // mailbox, so failures are also counted per email address. In-memory is
@@ -267,7 +292,7 @@ router.post('/signup', validateBody(authSignupSchema), async (_req: Request, res
 })
 
 // ── POST /api/auth/login ──────────────────────────────────────────────────────
-router.post('/login', validateBody(authLoginSchema), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/login', loginLimiter, validateBody(authLoginSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body
 

@@ -14,6 +14,7 @@ import {
   fundedSeconds,
   balanceState,
   type ClockRow,
+  isUsableAccount,
 } from './consultation'
 
 const LAWYER = '11111111-1111-1111-1111-111111111111'
@@ -285,5 +286,21 @@ describe('balance', () => {
   test('a nonsense rate does not produce Infinity', () => {
     assert.equal(fundedSeconds(FREE_CREDIT_PAISE, 0), 0)
     assert.equal(fundedSeconds(FREE_CREDIT_PAISE, Number.NaN), 0)
+  })
+})
+
+// ── Account gating [SEC-05] ──────────────────────────────────────────────────
+
+describe('suspended accounts lose API access', () => {
+  test('active and legacy-null accounts are usable', () => {
+    assert.equal(isUsableAccount('active'), true)
+    assert.equal(isUsableAccount(null), true, 'rows predating the column must not be locked out')
+    assert.equal(isUsableAccount(undefined), true)
+  })
+
+  test('suspended, banned and pending deletion are not', () => {
+    for (const s of ['suspended', 'banned', 'pending_deletion']) {
+      assert.equal(isUsableAccount(s), false, s)
+    }
   })
 })

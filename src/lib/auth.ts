@@ -11,6 +11,7 @@ import type { Request, Response, NextFunction } from 'express'
 import crypto from 'crypto'
 import { supabase, supabaseAuthValidator } from './supabase'
 import { logger } from './logger'
+import { isUsableAccount } from './consultation'
 
 export type Role = 'client' | 'lawyer' | 'admin'
 
@@ -20,7 +21,7 @@ export interface AuthUser {
   role: Role
   /** Display name for admin audit bylines. accounts first, JWT metadata second. */
   name: string | null
-  /** From accounts.status. Resolved but not gated on — nothing writes it yet. */
+  /** From accounts.status. Gated on by requireAuth — see isUsableAccount. */
   status: string | null
 }
 
@@ -117,12 +118,16 @@ function resolveName(
   return null
 }
 
-/** Ends the request with 401 unless a valid credential is present. */
+/** Ends the request with 401 unless a valid, usable credential is present. */
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   try {
     const user = await getAuthUser(req)
     if (!user) {
       res.status(401).json({ error: 'Not authenticated' })
+      return
+    }
+    if (!isUsableAccount(user.status)) {
+      res.status(403).json({ error: 'This account is not active.', code: 'ACCOUNT_SUSPENDED' })
       return
     }
     ;(req as AuthedRequest).user = user
@@ -142,6 +147,10 @@ export function requireRole(...roles: Role[]) {
       const user = await getAuthUser(req)
       if (!user) {
         res.status(401).json({ error: 'Not authenticated' })
+        return
+      }
+      if (!isUsableAccount(user.status)) {
+        res.status(403).json({ error: 'This account is not active.', code: 'ACCOUNT_SUSPENDED' })
         return
       }
       if (!roles.includes(user.role)) {
@@ -241,3 +250,5 @@ export const requireAdminSecret = machineSecretGuard('authorization')
 
 /** `x-admin-secret: <ADMIN_SECRET>` — the scheduled-job endpoints. */
 export const requireJobSecret = machineSecretGuard('x-admin-secret')
+
+export { isUsableAccount }

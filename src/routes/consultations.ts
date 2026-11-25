@@ -1220,6 +1220,26 @@ router.patch('/:id/cancel', async (req: Request, res: Response) => {
     const isParticipant = consultation.lawyer_id === user.id || consultation.client_id === user.id
     if (!isParticipant) { res.status(403).json({ error: 'Not authorized to cancel' }); return }
 
+    /**
+     * Cancel is for a consultation that never started. [PAY-01]
+     *
+     * It used to mark any consultation cancelled and unpaid, whatever had
+     * happened in it — so a client could talk for twenty minutes, call this,
+     * and pay nothing. Once the clock has started the only way out is
+     * settlement, which bills what was actually used.
+     */
+    if (consultation.started_at) {
+      const settled = await settleConsultation(String(req.params.id))
+      res.json({
+        message: 'Consultation ended and settled',
+        consultationId: req.params.id,
+        settled: true,
+        durationSeconds: settled.durationSeconds,
+        totalAmount: settled.totalAmount,
+      })
+      return
+    }
+
     // Void Razorpay pre-auth hold if payment was authorized
     if (consultation.razorpay_payment_id && consultation.payment_status === 'authorized') {
       try { await (razorpay.payments as any).cancel(consultation.razorpay_payment_id) } catch (e) {

@@ -24,14 +24,21 @@ export const allowedOrigins: string[] = (process.env.ALLOWED_ORIGINS || 'http://
   .map(o => o.trim())
   .filter(Boolean)
 
+/**
+ * Exactly which origins may call this API with credentials. [SEC-02]
+ *
+ * `.vercel.app` and `.netlify.app` used to be trusted wholesale, and anyone
+ * can deploy to either — so any stranger's preview site could make
+ * credentialed calls on behalf of a signed-in user. Previews now have to be
+ * named in ALLOWED_ORIGINS, which is a dashboard change, not a deploy.
+ */
 export function isAllowedOrigin(origin: string): boolean {
   if (allowedOrigins.includes(origin)) return true
   if (isDevelopment) return /^http:\/\/localhost:\d{2,5}$/.test(origin)
   return (
     origin === 'https://legalxonline.com' ||
     origin === 'https://www.legalxonline.com' ||
-    origin.endsWith('.legalxonline.com') ||
-    origin.endsWith('.vercel.app')
+    origin.endsWith('.legalxonline.com')
   )
 }
 
