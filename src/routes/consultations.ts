@@ -9,6 +9,11 @@ import { logger } from '../lib/logger'
 import { notifyAllDevices } from '../lib/push'
 import { getAuthUser } from '../lib/auth'
 import { isLive } from '../lib/presence'
+import {
+  decidePresence, durationSeconds as secondsBetween, clientChargeRupees,
+  lawyerEarningsRupees, fundingOf, isPaidForLawyer, LAWYER_UNPAID_MINUTES,
+  type ClockRow,
+} from '../lib/consultation'
 import { z } from 'zod'
 
 const router = Router()
@@ -447,12 +452,14 @@ export async function settleConsultation(id: string): Promise<{
     return { ok: true, answered: false, durationSeconds: 0, totalAmount: 0, creditsChargedPaise: 0 }
   }
 
-  const durationSeconds = Math.max(0, Math.floor((endedAt.getTime() - startedAt.getTime()) / 1000))
+  const durationSeconds = secondsBetween(startedAt, endedAt)
   const feePerMinute = Number(consultation.fee_per_minute)
-  const totalAmount = Math.max(
-    Math.ceil((durationSeconds / 60) * feePerMinute),
-    feePerMinute, // a call that connected bills at least its first minute
-  )
+  const funding = fundingOf(consultation.payment_status)
+  const totalAmount = clientChargeRupees(durationSeconds, feePerMinute)
+  // What the advocate is owed, which is not what the client paid: a free-grant
+  // consultation earns nothing, and the first few minutes of a paid one are
+  // the platform's. See lib/consultation.ts.
+  const lawyerEarnings = lawyerEarningsRupees(durationSeconds, feePerMinute, funding)
 
   let creditsChargedPaise: number | null = null
   if (consultation.payment_status === 'credits') {
@@ -472,6 +479,9 @@ export async function settleConsultation(id: string): Promise<{
     ended_at: endedAt.toISOString(),
     duration_seconds: durationSeconds,
     total_amount: totalAmount,
+    // Stored, not recomputed on read: a payout rule that changes later must
+    // not retroactively rewrite what an advocate already earned.
+    lawyer_earnings: lawyerEarnings,
   }).eq('id', id)
   if (updateErr) throw updateErr
 
@@ -655,7 +665,7 @@ router.get('/incoming', async (req: Request, res: Response) => {
     // call nobody is waiting on is worse than not ringing at all.
     const { data: consultation } = await supabase
       .from('consultations')
-      .select('status')
+      .select('status, payment_status, fee_per_minute')
       .eq('id', data.consultation_id)
       .maybeSingle()
 
@@ -663,12 +673,21 @@ router.get('/incoming', async (req: Request, res: Response) => {
       res.json({ call: null }); return
     }
 
+    // Whether this pays, said before they answer. An advocate accepting a call
+    // deserves to know it is pro bono up front rather than discovering it in a
+    // payout statement.
+    const funding = fundingOf(consultation.payment_status)
+
     res.json({
       call: {
         consultationId: data.consultation_id,
         clientId: data.client_id,
         type: data.type,
         expiresAt: data.expires_at,
+        funding,
+        paidForLawyer: isPaidForLawyer(funding),
+        feePerMinute: Number(consultation.fee_per_minute) || null,
+        unpaidMinutes: LAWYER_UNPAID_MINUTES,
       },
     })
   } catch (err) {
@@ -759,36 +778,15 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       return
     }
 
-    /**
-     * Fetching credentials is opening the room, not being in the call.
-     *
-     * Treating it as a join was wrong, and it cost clients money: both sides
-     * request a token the instant the screen opens, so the clock started while
-     * the caller was still on "Connecting..." — and ran for the whole attempt
-     * if the media session never established at all. This records that a side
-     * turned up. POST /:id/media-connected is what says they actually arrived.
-     */
-    const now = new Date().toISOString()
-    const presence: Record<string, string> = {}
-    if (isLawyer && !consultation.lawyer_joined_at) presence.lawyer_joined_at = now
-    if (isClient && !consultation.client_joined_at) presence.client_joined_at = now
-
-    if (Object.keys(presence).length) {
-      const { error: startErr } = await supabase
-        .from('consultations').update(presence).eq('id', consultationId)
-
-      if (startErr) {
-        // Not fatal to the call, but it decides what gets billed, so it is
-        // logged loudly rather than swallowed.
-        logger.error({ err: startErr.message, consultationId }, '[agora-token] could not record join')
-      } else {
-        Object.assign(consultation, presence)
-      }
-    }
+    // Fetching credentials opens the room; it is not yet being in the call.
+    // For voice and video the clock waits for media to connect, so a caller
+    // stuck on "Connecting…" is not billed for the attempt.
+    const hadLawyer = consultation.lawyer_joined_at
+    const presenceResult = await markPresence(consultation as any, user.id)
 
     // Ring the client once the lawyer is in, whether or not the clock started.
     // This is what brings a phone in a pocket back to the room.
-    if (isLawyer && presence.lawyer_joined_at) {
+    if (isLawyer && !hadLawyer && consultation.lawyer_joined_at) {
       void notifyAllDevices(consultation.client_id, {
         title: 'Your lawyer has joined',
         body: 'The consultation is starting now. Tap to join.',
@@ -832,7 +830,7 @@ router.get('/:id/agora-token', async (req: Request, res: Response) => {
       // — or never completes — has nothing to count from and pays nothing. A
       // device clock would disagree between the two sides and bill for time
       // nobody spent talking.
-      startedAt: consultation.started_at ?? null,
+      startedAt: presenceResult.startedAt,
       endedAt: consultation.ended_at ?? null,
     })
   } catch (err) {
@@ -860,7 +858,7 @@ router.post('/:id/media-connected', async (req: Request, res: Response) => {
     const id = String(req.params.id)
     const { data: consultation } = await supabase
       .from('consultations')
-      .select('id, client_id, lawyer_id, status, started_at, lawyer_joined_at, client_joined_at')
+      .select('id, type, client_id, lawyer_id, status, started_at, lawyer_joined_at, client_joined_at')
       .eq('id', id)
       .maybeSingle()
 
@@ -872,30 +870,10 @@ router.post('/:id/media-connected', async (req: Request, res: Response) => {
       res.status(403).json({ error: 'You are not a participant in this consultation' }); return
     }
 
-    if (consultation.status === 'completed' || consultation.status === 'cancelled') {
-      res.json({ startedAt: consultation.started_at ?? null }); return
-    }
-
-    // Whoever reports has, by definition, the other side in the channel with
-    // them — so this settles both and there is nothing left to wait for.
-    const now = new Date().toISOString()
-    const update: Record<string, string> = {}
-    if (!consultation.lawyer_joined_at) update.lawyer_joined_at = now
-    if (!consultation.client_joined_at) update.client_joined_at = now
-    if (!consultation.started_at) {
-      update.started_at = now
-      update.status = 'in_progress'
-    }
-
-    if (Object.keys(update).length) {
-      const { error } = await supabase.from('consultations').update(update).eq('id', id)
-      if (error) {
-        logger.error({ err: error.message, consultationId: id }, '[media-connected] could not start clock')
-        res.status(500).json({ error: 'Could not start the consultation clock.' }); return
-      }
-    }
-
-    res.json({ startedAt: consultation.started_at ?? update.started_at ?? now })
+    // Media connecting proves both sides are in the channel together, so this
+    // one report settles both and starts the clock.
+    const presence = await markPresence(consultation as any, user.id, { mediaConnected: true })
+    res.json({ startedAt: presence.startedAt })
   } catch (err) {
     console.error('[consultations/media-connected]', err)
     res.status(500).json({ error: 'Internal server error' })
@@ -953,10 +931,40 @@ router.post('/:id/end', async (req: Request, res: Response) => {
  * Returns an error marker when the caller is not a participant — the check
  * belongs here, once, rather than in each route that reads or writes messages.
  */
+/**
+ * Records that a side reached the room and starts the clock once both are
+ * actually there. The rule itself is in lib/consultation.ts and is tested;
+ * this only persists what it decides.
+ */
+async function markPresence(
+  consultation: ClockRow & { id: string },
+  userId: string,
+  opts: { mediaConnected?: boolean } = {},
+): Promise<{ startedAt: string | null; status: string }> {
+  const decision = decidePresence(consultation, userId, new Date().toISOString(), opts)
+
+  if (Object.keys(decision).length === 0) {
+    return { startedAt: consultation.started_at, status: consultation.status }
+  }
+
+  const { error } = await supabase.from('consultations').update(decision).eq('id', consultation.id)
+  if (error) {
+    // Not fatal to the conversation, but it decides what gets billed.
+    logger.error({ err: error.message, consultationId: consultation.id }, '[presence] could not record join')
+    return { startedAt: consultation.started_at, status: consultation.status }
+  }
+
+  Object.assign(consultation, decision)
+  return {
+    startedAt: consultation.started_at ?? decision.started_at ?? null,
+    status: decision.status ?? consultation.status,
+  }
+}
+
 async function conversationFor(consultationId: string, userId: string) {
   const { data: consultation } = await supabase
     .from('consultations')
-    .select('id, client_id, lawyer_id, status, started_at, ended_at')
+    .select('id, type, client_id, lawyer_id, status, started_at, ended_at, lawyer_joined_at, client_joined_at')
     .eq('id', consultationId)
     .maybeSingle()
 
@@ -1025,12 +1033,17 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
 
     if (error) throw error
 
+    // Opening the room is how a chat says "I am here". Nothing else reports it
+    // — there is no media session — so without this the clock never started,
+    // and both sides sat on "Waiting for the client" while messages flowed.
+    const presence = await markPresence(found.consultation as any, user.id)
+
     res.json({
       conversationId: found.conversationId,
       messages: data ?? [],
       selfId: user.id,
-      status: found.consultation.status,
-      startedAt: found.consultation.started_at,
+      status: presence.status,
+      startedAt: presence.startedAt,
       endedAt: found.consultation.ended_at,
     })
   } catch (err) {
