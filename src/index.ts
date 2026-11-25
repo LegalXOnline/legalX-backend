@@ -118,6 +118,18 @@ const validateCsrf = (req: express.Request, res: express.Response, next: express
   next()
 }
 
+/**
+ * Nothing here may sit in a shared cache. With no Cache-Control of our own,
+ * Vercel defaulted /api/auth/me to `public` — explicit permission for a CDN or
+ * proxy to store a response carrying a Set-Cookie and hand it to someone else.
+ */
+app.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+  res.setHeader('Pragma', 'no-cache')
+  res.setHeader('Expires', '0')
+  next()
+})
+
 // ── Security middleware ───────────────────────────────────────────────────────
 /**
  * crossOriginResourcePolicy is relaxed to cross-origin because the browser now
