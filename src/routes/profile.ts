@@ -1,8 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import multer from 'multer'
 import { createClient } from '@supabase/supabase-js'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { validateBody, profileUpdateSchema } from '../lib/validation'
+import { requireAuth, type AuthedRequest } from '../lib/auth'
 
 const router = Router()
 
@@ -26,24 +27,6 @@ const upload = multer({
   },
 })
 
-interface AuthedRequest extends Request {
-  user?: { id: string; email: string }
-}
-
-async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
-  try {
-    const token = req.cookies?.lx_access_token || req.headers.authorization?.replace('Bearer ', '')
-    if (!token) return res.status(401).json({ error: 'Not authenticated' })
-
-    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-    if (error || !data.user) return res.status(401).json({ error: 'Invalid or expired session' })
-
-    req.user = { id: data.user.id, email: data.user.email ?? '' }
-    next()
-  } catch {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-}
 
 /** The stored path signed for reading, or null. The bucket is private. */
 async function signAvatar(path: string | null): Promise<string | null> {

@@ -1,37 +1,15 @@
 import { Router, Request, Response, NextFunction } from 'express'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import {
   sendLawyerDocsSubmittedAdmin,
   sendLawyerDocsReceivedConfirmation,
 } from '../lib/email'
 import { validateBody, lawyerSettingsUpdateSchema } from '../lib/validation'
+import { getAuthUser } from '../lib/auth'
+import { isLive, presenceCutoffIso, HEARTBEAT_INTERVAL_MS, PRESENCE_WINDOW_MS } from '../lib/presence'
 
 const router = Router()
 
-// ── Auth helper ───────────────────────────────────────────────────────────────
-// Returns user with role from public.accounts (source of truth), not user_metadata.
-async function getAuthUser(req: Request): Promise<{ id: string; email: string | undefined; role: string } | null> {
-  const token =
-    req.cookies?.lx_access_token ||
-    req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return null
-
-  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-  if (error || !data.user) return null
-
-  // Get role from accounts table — not user_metadata
-  const { data: account } = await supabase
-    .from('accounts')
-    .select('role')
-    .eq('id', data.user.id)
-    .single()
-
-  return {
-    id: data.user.id,
-    email: data.user.email,
-    role: account?.role ?? (data.user.role ?? 'client'),
-  }
-}
 
 /**
  * Avatar tile colours.
@@ -70,7 +48,10 @@ function mapRow(d: any) {
     barNumber:       d.bar_council_number ?? '',
     barState:        d.bar_council_state ?? '',
     verified:        d.verification_status === 'verified',
-    online:          d.is_online ?? false,
+    // The lease, not the raw flag — see lib/presence.ts. last_seen_at itself
+    // stays out: this is a public directory, and broadcasting when someone was
+    // last at their desk is surveillance, not availability.
+    online:          isLive(d.is_online, d.last_seen_at),
     specializations: d.specializations ?? [],
     primarySpec:     d.primary_specialization ?? 'General Practice',
     experience:      d.years_experience ?? 0,
@@ -127,15 +108,16 @@ router.get('/me', async (req: Request, res: Response) => {
         profile: null,
       })
     }
-
+    // Two different questions, so both are sent: `is_online` is what the
+    // advocate chose and what the switch shows; `online` is whether a client
+    // can reach them right now. Seeding the switch from the lease would stop
+    // the heartbeat ever running after a crashed tab.
     return res.json({
       onboarding_complete:  data.onboarding_complete ?? false,
       verification_status:  data.verification_status ?? 'pending_signup',
       rejection_reason:     data.rejection_reason ?? null,
-      // Exposed at the top level on purpose: mapRow() renames this to `online`
-      // for the public directory, so the portal could never read it back and
-      // the availability switch reset to Offline on every page load.
-      is_online:            data.is_online ?? false,
+      is_online: data.is_online ?? false,
+      online:    isLive(data.is_online, data.last_seen_at),
       profile: mapRow(data),
     })
   } catch (err) {
@@ -439,10 +421,15 @@ router.patch('/me/status', async (req: Request, res: Response) => {
     }
     const isOnline = raw
 
-    // Upsert so the row always exists even if onboarding is incomplete
+    // Going offline ends the lease now rather than letting it lapse.
+    const now = new Date().toISOString()
     const { error: updateError } = await supabase
       .from('lawyer_profiles')
-      .update({ is_online: isOnline, last_seen_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .update({
+        is_online: isOnline,
+        last_seen_at: isOnline ? now : null,
+        updated_at: now,
+      })
       .eq('account_id', user.id)
 
     if (updateError) {
@@ -450,9 +437,61 @@ router.patch('/me/status', async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Failed to update availability status' })
     }
 
-    return res.json({ isOnline, message: `Status set to ${isOnline ? 'online' : 'offline'}` })
+    return res.json({
+      isOnline,
+      message: `Status set to ${isOnline ? 'online' : 'offline'}`,
+      // Sent, not hardcoded, so the window can be retuned without a new bundle.
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+      presenceWindowMs: PRESENCE_WINDOW_MS,
+    })
   } catch (err) {
     console.error('[lawyers/me/status] Unexpected error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── POST /api/lawyers/me/heartbeat ───────────────────────────────────────────
+/**
+ * Renews the lease while the portal is open. Stop calling it and the lease
+ * lapses on its own — the absence of a renewal is the signal.
+ *
+ * It will not bring back an advocate who went offline deliberately: that would
+ * re-list someone who left a tab open after clocking off.
+ */
+router.post('/me/heartbeat', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (user.role !== 'lawyer') {
+      return res.status(403).json({ error: 'Only lawyers have an availability lease' })
+    }
+
+    const { data, error } = await supabase
+      .from('lawyer_profiles')
+      .update({ last_seen_at: new Date().toISOString() })
+      .eq('account_id', user.id)
+      // Intent only. Also requiring a fresh last_seen_at would mean a lease
+      // can only be renewed while still valid, so one sleep longer than the
+      // window would make it permanently unrenewable.
+      .eq('is_online', true)
+      .select('account_id')
+
+    if (error) {
+      console.error('[lawyers/me/heartbeat] DB error:', error.message)
+      return res.status(500).json({ error: 'Could not renew availability' })
+    }
+
+    // Zero rows means they are marked offline, so there is no lease to renew.
+    // The portal uses this to correct a switch the server disagrees with.
+    const renewed = (data?.length ?? 0) > 0
+
+    return res.json({
+      renewed,
+      isOnline: renewed,
+      heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+    })
+  } catch (err) {
+    console.error('[lawyers/me/heartbeat] Unexpected error:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
@@ -611,12 +650,25 @@ router.post('/onboarding', async (req: Request, res: Response) => {
 })
 
 // ── GET /api/lawyers ─────────────────────────────────────────────────────────
-router.get('/', async (_req: Request, res: Response) => {
+/**
+ * `?onlineOnly=true` filters in the database rather than fetching every
+ * verified row and dropping most of them in JS. Same rule as isLive(), just
+ * expressed as a timestamp the planner can use.
+ */
+router.get('/', async (req: Request, res: Response) => {
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('lawyer_profiles')
       .select('*')
       .eq('verification_status', 'verified')
+
+    if (req.query.onlineOnly === 'true') {
+      query = query
+        .eq('is_online', true)
+        .gte('last_seen_at', presenceCutoffIso())
+    }
+
+    const { data, error } = await query
       .order('avg_rating', { ascending: false })
 
     if (error) {

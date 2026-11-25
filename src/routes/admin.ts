@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
+import { requireAdmin, type AuthUser, type AuthedRequest } from '../lib/auth'
 import {
   validateBody,
   validateParams,
@@ -86,33 +87,7 @@ function escapeLike(term: string): string {
   return term.replace(/[%_,()]/g, '')
 }
 
-// ── Auth middleware — validates the HttpOnly cookie set by /api/auth/login ────
-async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  try {
-    const token = req.cookies?.lx_access_token || req.headers.authorization?.replace('Bearer ', '')
-    if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' })
-    }
-
-    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-    if (error || !data.user) {
-      return res.status(401).json({ error: 'Invalid or expired session' })
-    }
-
-    // Get role from accounts table — source of truth
-    const { data: account } = await supabase.from('accounts').select('role').eq('id', data.user.id).single()
-    const role = account?.role ?? data.user.user_metadata?.role
-    if (role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden — admin access only' })
-    }
-
-    // Attach user to request for downstream handlers
-    ;(req as any).user = data.user
-    next()
-  } catch {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-}
+// Auth lives in lib/auth.ts now — same contract, minus the copy.
 
 // ── GET /api/admin/lawyers?status=&search=&page=&pageSize= ───────────────────
 // `status=all` returns every lawyer. Omitting status keeps the historical
@@ -1602,10 +1577,8 @@ router.delete('/shorts/:id', requireAdmin, validateParams(uuidParamSchema), asyn
  * reader could plausibly hold to account — never an account UUID, and never
  * the "dev-unauthenticated" placeholder the import carried.
  */
-function reviewerName(user: any): string {
-  const meta = user?.user_metadata ?? {}
-  const name = [meta.first_name, meta.last_name].filter(Boolean).join(' ').trim()
-  return name || meta.full_name || user?.email || 'LegalX Editorial'
+function reviewerName(user: AuthUser | undefined): string {
+  return user?.name || user?.email || 'LegalX Editorial'
 }
 
 // ── GET /api/admin/knowledge ─────────────────────────────────────────────────

@@ -6,22 +6,18 @@ import { createClient } from '@supabase/supabase-js'
 import { supabase } from '../lib/supabase'
 import { notifyAdmins } from '../lib/notify'
 import { sendDocumentUploadedAlert } from '../lib/email'
+import { getAuthUser } from '../lib/auth'
 
 const router = Router()
 
-// ── Two separate Supabase clients ─────────────────────────────────────────────
-// authClient: validates user JWTs — may have session state set per-request
-// storageClient: always uses service_role key for storage ops — never user-scoped
+// ── Storage client ────────────────────────────────────────────────────────────
+// Kept separate from the shared data client so a storage operation can never
+// inherit a user-scoped session. JWT validation is no longer done here at all —
+// lib/auth.ts owns it, on the dedicated validator instance.
 const SUPABASE_URL         = process.env.SUPABASE_URL!
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
 
-// Fresh client per module load — service role, never contaminated by user JWTs
 const storageClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-})
-
-// Auth client (also service role for getUser() — getUser validates the JWT server-side)
-const authClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
 
@@ -35,30 +31,6 @@ const upload = multer({
     cb(new Error('Only JPG, PNG and PDF files are accepted'))
   },
 })
-
-// ── Auth helper ───────────────────────────────────────────────────────────────
-async function getAuthUser(req: Request): Promise<{ id: string; email: string | undefined; role: string } | null> {
-  const token =
-    req.cookies?.lx_access_token ||
-    req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return null
-
-  // Use authClient.auth.getUser — this does NOT mutate session state on service role client
-  const { data, error } = await authClient.auth.getUser(token)
-  if (error || !data.user) return null
-
-  const { data: account } = await authClient
-    .from('accounts')
-    .select('role')
-    .eq('id', data.user.id)
-    .single()
-
-  return {
-    id:    data.user.id,
-    email: data.user.email,
-    role:  account?.role ?? 'client',
-  }
-}
 
 /**
  * A client document is named by the service that asked for it, so the set is

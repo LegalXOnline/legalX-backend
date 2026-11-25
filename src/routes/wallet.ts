@@ -1,9 +1,10 @@
 import { Router, Request, Response } from 'express'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
 import { validateBody, walletTopupOrderSchema, walletTopupVerifySchema } from '../lib/validation'
+import { getAuthUser } from '../lib/auth'
 
 /**
  * The client's wallet.
@@ -26,14 +27,6 @@ const razorpay = new Razorpay({
 
 /** True while the configured key is a test key. Surfaced so the UI can say so. */
 const isTestMode = (process.env.RAZORPAY_KEY_ID ?? '').startsWith('rzp_test')
-
-async function getAuthUser(req: Request) {
-  const token = req.cookies?.lx_access_token || req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return null
-  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-  if (error || !data.user) return null
-  return { id: data.user.id }
-}
 
 // ── GET /api/wallet ──────────────────────────────────────────────────────────
 router.get('/', async (req: Request, res: Response) => {

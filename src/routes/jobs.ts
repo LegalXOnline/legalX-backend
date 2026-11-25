@@ -1,8 +1,8 @@
-import { Router, Request, Response, NextFunction } from 'express'
-import crypto from 'crypto'
+import { Router, Request, Response } from 'express'
 import { logger } from '../lib/logger'
 import { supabase } from '../lib/supabase'
 import { FEED_SOURCES } from '../lib/sources/rss'
+import { requireJobSecret } from '../lib/auth'
 
 const router = Router()
 
@@ -15,28 +15,9 @@ const router = Router()
  * without a CORS preflight the server never approves. Adding a CSRF exemption
  * to the admin router instead would have let an attacker skip CSRF by sending
  * a bogus secret and falling back to cookie auth.
+ *
+ * requireJobSecret is in lib/auth.ts and reads `x-admin-secret` specifically.
  */
-function requireJobSecret(req: Request, res: Response, next: NextFunction) {
-  const expected = process.env.ADMIN_SECRET
-  if (!expected) {
-    logger.error({}, '[jobs] ADMIN_SECRET is not set — job endpoints disabled')
-    return res.status(503).json({ error: 'Job endpoints are not configured' })
-  }
-
-  const provided = req.headers['x-admin-secret']
-  if (typeof provided !== 'string') {
-    return res.status(401).json({ error: 'Missing job credentials' })
-  }
-
-  const a = Buffer.from(provided)
-  const b = Buffer.from(expected)
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    logger.warn({ reqId: req.id, ip: req.ip }, '[jobs] bad secret')
-    return res.status(401).json({ error: 'Invalid job credentials' })
-  }
-
-  next()
-}
 
 // ── POST /api/jobs/retention ─────────────────────────────────────────────────
 // Housekeeping. Supabase's free tier is 500 MB and three tables grow without

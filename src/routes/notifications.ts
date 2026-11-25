@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import crypto from 'crypto'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
 import {
   validateParams, validateQuery, validateBody,
@@ -9,24 +9,9 @@ import {
   deviceTokenSchema, deviceTokenUnregisterSchema,
 } from '../lib/validation'
 import { vapidPublicKey, pushConfigured } from '../lib/push'
+import { getAuthUser as getUser } from '../lib/auth'
 
 const router = Router()
-
-/** Resolves the caller from the HttpOnly cookie (or a mobile Bearer token). */
-async function getUser(req: Request) {
-  const token =
-    req.cookies?.lx_access_token ||
-    req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return null
-
-  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-  if (error || !data.user) return null
-
-  const { data: account } = await supabase
-    .from('accounts').select('role').eq('id', data.user.id).maybeSingle()
-
-  return { id: data.user.id, role: account?.role ?? data.user.user_metadata?.role ?? 'client' }
-}
 
 // ── Web push ─────────────────────────────────────────────────────────────────
 

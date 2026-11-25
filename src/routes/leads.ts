@@ -1,50 +1,24 @@
-import { Router, Request, Response, NextFunction } from 'express'
+import { Router, Response, NextFunction } from 'express'
 import { supabase } from '../lib/supabase'
 import { sendLeadAlert, sendUserConfirmation } from '../lib/email'
 import { notifyAdmins } from '../lib/notify'
 import { rateLimit } from 'express-rate-limit'
-import crypto from 'crypto'
 import { validateBody, validateParams, leadCreateSchema, leadUpdateBodySchema, leadIdParamSchema } from '../lib/validation'
+import { optionalAuth, requireAdminSecret, type AuthedRequest } from '../lib/auth'
 
 const router = Router()
 
 // Tight rate limit for lead creation — 10 per hour per IP
 const leadLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, standardHeaders: true })
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET
-if (!ADMIN_SECRET) {
-  throw new Error('ADMIN_SECRET must be set in environment')
-}
-
-async function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  try {
-    const authHeader = req.headers.authorization
-    if (!authHeader) {
-      return res.status(401).json({ error: 'Not authenticated' })
-    }
-    const token = authHeader.replace('Bearer ', '')
-    if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' })
-    }
-
-    // Timing-safe comparison
-    const tokenBuf = Buffer.from(token)
-    const secretBuf = Buffer.from(ADMIN_SECRET!)
-    if (tokenBuf.length !== secretBuf.length || !crypto.timingSafeEqual(tokenBuf, secretBuf)) {
-      return res.status(401).json({ error: 'Unauthorized' })
-    }
-
-    next()
-  } catch {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-}
-
 // ── POST /api/leads ──────────────────────────────────────────────────────────
-// Called the moment user submits Step 0 (Lead Gate) on Apply Online page
-router.post('/', leadLimit, validateBody(leadCreateSchema), async (req, res, next) => {
+// Open to guests — the lead gate lets someone enquire before signing up.
+// optionalAuth only stamps an owner when there is one, which is what makes the
+// enquiry readable back to them later.
+router.post('/', leadLimit, optionalAuth, validateBody(leadCreateSchema), async (req: AuthedRequest, res, next) => {
   try {
     const { name, phone, email, serviceSlug, serviceTitle } = req.body
+    const caller = req.user
 
     const { data, error } = await supabase
       .from('leads')
@@ -55,6 +29,9 @@ router.post('/', leadLimit, validateBody(leadCreateSchema), async (req, res, nex
         service_slug: serviceSlug,
         service_title: serviceTitle,
         source: 'apply-online',
+        // Only a client owns an enquiry — an admin or advocate here is acting
+        // for someone else.
+        account_id: caller?.role === 'client' ? caller.id : null,
       })
       .select('id')
       .single()
@@ -84,7 +61,7 @@ router.post('/', leadLimit, validateBody(leadCreateSchema), async (req, res, nex
 
 // ── PATCH /api/leads/:id ─────────────────────────────────────────────────────
 // Update lead status (contacted / converted / dropped)
-router.patch('/:id', requireAdmin, validateParams(leadIdParamSchema), validateBody(leadUpdateBodySchema), async (req, res, next) => {
+router.patch('/:id', requireAdminSecret, validateParams(leadIdParamSchema), validateBody(leadUpdateBodySchema), async (req, res, next) => {
   try {
     const { status } = req.body
 
@@ -102,7 +79,7 @@ router.patch('/:id', requireAdmin, validateParams(leadIdParamSchema), validateBo
 
 // ── GET /api/leads ───────────────────────────────────────────────────────────
 // Simple admin list — protected by bearer token check
-router.get('/', requireAdmin, async (req, res, next) => {
+router.get('/', requireAdminSecret, async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from('leads')

@@ -2,11 +2,13 @@ import { Router, Request, Response } from 'express'
 import Razorpay from 'razorpay'
 import { RtcTokenBuilder, RtcRole } from 'agora-token'
 import crypto from 'crypto'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { validateBody, messageSendSchema } from '../lib/validation'
 import { createNotifications } from '../lib/notify'
 import { logger } from '../lib/logger'
 import { notifyAllDevices } from '../lib/push'
+import { getAuthUser } from '../lib/auth'
+import { isLive } from '../lib/presence'
 import { z } from 'zod'
 
 const router = Router()
@@ -15,28 +17,6 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID!,
   key_secret: process.env.RAZORPAY_KEY_SECRET!,
 })
-
-// ── Auth helper ───────────────────────────────────────────────────────────────
-async function getAuthUser(req: Request): Promise<{ id: string; email: string | undefined; role: string } | null> {
-  const token =
-    req.cookies?.lx_access_token ||
-    req.headers.authorization?.replace('Bearer ', '')
-  if (!token) return null
-  const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-  if (error || !data.user) return null
-
-  const { data: account } = await supabase
-    .from('accounts')
-    .select('role')
-    .eq('id', data.user.id)
-    .single()
-
-  return {
-    id: data.user.id,
-    email: data.user.email,
-    role: account?.role ?? (data.user.role ?? 'client'),
-  }
-}
 
 // ── Agora token helpers ───────────────────────────────────────────────────────
 // Channel = consultationId (unique per session)
@@ -121,16 +101,31 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
 
     const { lawyerId, type, maxMinutes } = req.body
 
-    // Verify lawyer exists, is verified + online
+    // Verify lawyer exists, is verified, and has a live availability lease
     const { data: lawyer, error: lErr } = await supabase
       .from('lawyer_profiles')
-      .select('account_id, first_name, last_name, verification_status, is_online, consultation_fee_chat, consultation_fee_voice, consultation_fee_video')
+      .select('account_id, first_name, last_name, verification_status, is_online, last_seen_at, consultation_fee_chat, consultation_fee_voice, consultation_fee_video')
       .eq('account_id', lawyerId)
       .single()
 
     if (lErr || !lawyer) { res.status(404).json({ error: 'Lawyer not found' }); return }
     if (lawyer.verification_status !== 'verified') { res.status(400).json({ error: 'Lawyer is not verified' }); return }
-    if (!lawyer.is_online) { res.status(400).json({ error: 'Lawyer is currently offline' }); return }
+
+    // The lease, not the flag. is_online alone let calls through to advocates
+    // who had never signed in — the client joined a real channel and waited
+    // forever for someone who was not there, with no error anywhere.
+    if (!isLive(lawyer.is_online, lawyer.last_seen_at)) {
+      const name = `${lawyer.first_name ?? ''} ${lawyer.last_name ?? ''}`.trim() || 'This advocate'
+      logger.info(
+        { lawyerId, isOnline: lawyer.is_online, lastSeenAt: lawyer.last_seen_at },
+        '[initiate] refused — advocate availability lease has lapsed',
+      )
+      res.status(409).json({
+        error: `${name} is not available right now. Please choose an advocate showing as online.`,
+        code: 'LAWYER_UNAVAILABLE',
+      })
+      return
+    }
 
     const feeMap: Record<string, number> = {
       chat: Number(lawyer.consultation_fee_chat) || 20,
