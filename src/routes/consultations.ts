@@ -11,7 +11,7 @@ import { getAuthUser } from '../lib/auth'
 import { isLive } from '../lib/presence'
 import {
   decidePresence, durationSeconds as secondsBetween, clientChargeRupees,
-  lawyerEarningsRupees, fundingOf, isPaidForLawyer, LAWYER_UNPAID_MINUTES,
+  lawyerEarningsRupees, fundingOf, isPaidForLawyer, LAWYER_UNPAID_MINUTES, balanceState,
   type ClockRow,
 } from '../lib/consultation'
 import { z } from 'zod'
@@ -964,7 +964,7 @@ async function markPresence(
 async function conversationFor(consultationId: string, userId: string) {
   const { data: consultation } = await supabase
     .from('consultations')
-    .select('id, type, client_id, lawyer_id, status, started_at, ended_at, lawyer_joined_at, client_joined_at')
+    .select('id, type, client_id, lawyer_id, status, started_at, ended_at, lawyer_joined_at, client_joined_at, credits_held_paise, fee_per_minute')
     .eq('id', consultationId)
     .maybeSingle()
 
@@ -973,17 +973,27 @@ async function conversationFor(consultationId: string, userId: string) {
     return { error: 'forbidden' as const }
   }
 
+  // One thread per client and advocate, carried across every consultation they
+  // have. Keyed per consultation it started empty every time, so a client
+  // returning to the same advocate lost everything said before.
   const { data: existing } = await supabase
     .from('conversations')
     .select('id')
-    .eq('consultation_id', consultationId)
+    .eq('type', 'consultation')
+    .eq('client_id', consultation.client_id)
+    .eq('lawyer_id', consultation.lawyer_id)
     .maybeSingle()
 
   if (existing) return { conversationId: existing.id, consultation }
 
   const { data: created, error: createErr } = await supabase
     .from('conversations')
-    .insert({ type: 'consultation', consultation_id: consultationId })
+    .insert({
+      type: 'consultation',
+      consultation_id: consultationId,
+      client_id: consultation.client_id,
+      lawyer_id: consultation.lawyer_id,
+    })
     .select('id')
     .single()
 
@@ -994,7 +1004,9 @@ async function conversationFor(consultationId: string, userId: string) {
     const { data: raced } = await supabase
       .from('conversations')
       .select('id')
-      .eq('consultation_id', consultationId)
+      .eq('type', 'consultation')
+      .eq('client_id', consultation.client_id)
+      .eq('lawyer_id', consultation.lawyer_id)
       .maybeSingle()
     if (raced) return { conversationId: raced.id, consultation }
 
@@ -1026,7 +1038,7 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
       .from('messages')
-      .select('id, sender_id, content, attachment_url, attachment_name, attachment_size, created_at')
+      .select('id, sender_id, content, attachment_url, attachment_name, attachment_size, created_at, consultation_id')
       .eq('conversation_id', found.conversationId)
       .order('created_at', { ascending: true })
       .limit(500)
@@ -1038,6 +1050,17 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
     // and both sides sat on "Waiting for the client" while messages flowed.
     const presence = await markPresence(found.consultation as any, user.id)
 
+    // What is left to spend, so the room can warn before the money runs out
+    // rather than cutting someone off mid-sentence.
+    const elapsed = presence.startedAt
+      ? secondsBetween(presence.startedAt, new Date())
+      : 0
+    const balance = balanceState(
+      Number((found.consultation as any).credits_held_paise ?? 0),
+      Number((found.consultation as any).fee_per_minute ?? 0),
+      elapsed,
+    )
+
     res.json({
       conversationId: found.conversationId,
       messages: data ?? [],
@@ -1045,6 +1068,8 @@ router.get('/:id/messages', async (req: Request, res: Response) => {
       status: presence.status,
       startedAt: presence.startedAt,
       endedAt: found.consultation.ended_at,
+      consultationId: String(req.params.id),
+      ...balance,
     })
   } catch (err) {
     console.error('[consultations/messages GET]', err)
@@ -1086,6 +1111,8 @@ router.post('/:id/messages', validateBody(messageSendSchema), async (req: Reques
       .from('messages')
       .insert({
         conversation_id: found.conversationId,
+        // The thread spans sessions; this says where in it the message sits.
+        consultation_id: String(req.params.id),
         sender_id: user.id,
         content: content ?? null,
         attachment_url: attachmentUrl ?? null,

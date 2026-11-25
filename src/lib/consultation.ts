@@ -154,3 +154,45 @@ export function fundingOf(paymentStatus: string | null | undefined): Funding {
 export function unpaidMinutesRemaining(seconds: number): number {
   return Math.max(0, Math.ceil((LAWYER_UNPAID_MINUTES * 60 - seconds) / 60))
 }
+
+// ── Running out ──────────────────────────────────────────────────────────────
+
+/** How long before the money runs out that we start saying so. */
+export const LOW_BALANCE_SECONDS = 60
+
+/** How many seconds the credit authorised at the start actually buys. */
+export function fundedSeconds(heldPaise: number, feePerMinute: number): number {
+  if (!Number.isFinite(heldPaise) || heldPaise <= 0) return 0
+  if (!Number.isFinite(feePerMinute) || feePerMinute <= 0) return 0
+  return Math.floor((heldPaise / (feePerMinute * 100)) * 60)
+}
+
+export interface BalanceState {
+  /** Seconds of talking left. 0 once the credit is gone. */
+  secondsRemaining: number
+  /** True inside the final minute, so the room can say "top up to continue". */
+  lowBalance: boolean
+  /** True once there is nothing left to spend. */
+  exhausted: boolean
+}
+
+/**
+ * What is left of the authorised credit, given how long they have been
+ * talking. The ceiling is what was held when the consultation was placed, so
+ * this can never promise more than the client agreed to spend.
+ */
+export function balanceState(
+  heldPaise: number,
+  feePerMinute: number,
+  elapsedSeconds: number,
+): BalanceState {
+  const funded = fundedSeconds(heldPaise, feePerMinute)
+  const secondsRemaining = Math.max(0, funded - Math.max(0, elapsedSeconds))
+
+  return {
+    secondsRemaining,
+    // Unfunded from the outset is not a warning, it is the exhausted case.
+    lowBalance: funded > 0 && secondsRemaining > 0 && secondsRemaining <= LOW_BALANCE_SECONDS,
+    exhausted: funded > 0 && secondsRemaining === 0,
+  }
+}

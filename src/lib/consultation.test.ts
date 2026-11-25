@@ -11,6 +11,8 @@ import {
   unpaidMinutesRemaining,
   FREE_CREDIT_PAISE,
   LAWYER_UNPAID_MINUTES,
+  fundedSeconds,
+  balanceState,
   type ClockRow,
 } from './consultation'
 
@@ -237,5 +239,51 @@ describe('the free grant', () => {
     const feePerMinute = 40
     const affordable = Math.floor(FREE_CREDIT_PAISE / (feePerMinute * 100))
     assert.equal(affordable, 2)
+  })
+})
+
+// ── Running out of credit ────────────────────────────────────────────────────
+// The client is warned inside the final minute so they can top up and carry on
+// rather than being cut off mid-sentence.
+
+describe('balance', () => {
+  const FEE = 40 // ₹40/min
+
+  test('the ₹100 grant buys two and a half minutes at ₹40', () => {
+    assert.equal(fundedSeconds(FREE_CREDIT_PAISE, FEE), 150)
+  })
+
+  test('counts down as the consultation runs', () => {
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 0).secondsRemaining, 150)
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 50).secondsRemaining, 100)
+  })
+
+  test('warns inside the final minute, and not before', () => {
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 89).lowBalance, false, '61s left is not a warning')
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 90).lowBalance, true, '60s left is')
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 149).lowBalance, true)
+  })
+
+  test('stops warning once it is actually gone', () => {
+    const out = balanceState(FREE_CREDIT_PAISE, FEE, 150)
+    assert.equal(out.secondsRemaining, 0)
+    assert.equal(out.lowBalance, false, 'exhausted is a different message from running low')
+    assert.equal(out.exhausted, true)
+  })
+
+  test('never goes negative when a call overruns', () => {
+    assert.equal(balanceState(FREE_CREDIT_PAISE, FEE, 9999).secondsRemaining, 0)
+  })
+
+  test('no credit held is neither a warning nor exhausted', () => {
+    const none = balanceState(0, FEE, 10)
+    assert.equal(none.secondsRemaining, 0)
+    assert.equal(none.lowBalance, false)
+    assert.equal(none.exhausted, false, 'a wallet-funded call holds nothing and must not look empty')
+  })
+
+  test('a nonsense rate does not produce Infinity', () => {
+    assert.equal(fundedSeconds(FREE_CREDIT_PAISE, 0), 0)
+    assert.equal(fundedSeconds(FREE_CREDIT_PAISE, Number.NaN), 0)
   })
 })
