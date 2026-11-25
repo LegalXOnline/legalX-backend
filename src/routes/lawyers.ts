@@ -450,6 +450,68 @@ router.patch('/me/status', async (req: Request, res: Response) => {
   }
 })
 
+// ── GET /api/lawyers/payouts ─────────────────────────────────────────────────
+/**
+ * The advocate's own payout history. The portal has called this since it was
+ * built; it never existed, so every dashboard load spent a round trip on a 404
+ * that `/:slug` answered by looking up a lawyer named "payouts".
+ *
+ * MUST stay above GET /:slug, which would otherwise swallow it.
+ */
+router.get('/payouts', async (req: Request, res: Response) => {
+  try {
+    const user = await getAuthUser(req)
+    if (!user) return res.status(401).json({ error: 'Not authenticated' })
+    if (user.role !== 'lawyer') return res.status(403).json({ error: 'Not a lawyer account' })
+
+    const [{ data: rows }, { data: profile }] = await Promise.all([
+      supabase
+        .from('payouts')
+        .select('id, period_start, period_end, gross_amount, tds_amount, platform_fee, net_amount, status, transaction_count')
+        .eq('lawyer_id', user.id)
+        .order('period_start', { ascending: false })
+        .limit(24),
+      supabase.from('lawyer_profiles').select('pan_number').eq('account_id', user.id).maybeSingle(),
+    ])
+
+    const payouts = rows ?? []
+    const hasPan = Boolean(profile?.pan_number)
+
+    const cycles = payouts.map(p => ({
+      id: p.id,
+      periodStart: p.period_start,
+      periodEnd: p.period_end,
+      // Not broken out per source yet — the payout row carries one gross
+      // figure. Reported as consultation earnings rather than invented splits.
+      consultationEarnings: Number(p.gross_amount) || 0,
+      draftingEarnings: 0,
+      verificationEarnings: 0,
+      platformFee: Number(p.platform_fee) || 0,
+      grossAmount: Number(p.gross_amount) || 0,
+      tdsAmount: Number(p.tds_amount) || 0,
+      netAmount: Number(p.net_amount) || 0,
+      status: p.status as 'pending' | 'processing' | 'paid',
+      transactionCount: Number(p.transaction_count) || 0,
+    }))
+
+    return res.json({
+      currentCyclePending: cycles
+        .filter(c => c.status !== 'paid')
+        .reduce((sum, c) => sum + c.netAmount, 0),
+      totalEarned: cycles
+        .filter(c => c.status === 'paid')
+        .reduce((sum, c) => sum + c.netAmount, 0),
+      // Without a PAN on file, TDS is withheld at the higher statutory rate.
+      hasPan,
+      tdsRate: hasPan ? 10 : 20,
+      cycles,
+    })
+  } catch (err) {
+    console.error('[lawyers/payouts] error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 // ── POST /api/lawyers/me/heartbeat ───────────────────────────────────────────
 /**
  * Renews the lease while the portal is open. Stop calling it and the lease

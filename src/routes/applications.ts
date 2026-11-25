@@ -4,6 +4,7 @@ import { validateBody, validateParams, applicationCreateSchema, applicationIdPar
 import { sendClientApplicationConfirmation, sendDocumentsSubmittedAlert } from '../lib/email'
 import { notifyAdmins } from '../lib/notify'
 import { requireAuth, optionalAuth, ownsOrAdmin, type AuthedRequest } from '../lib/auth'
+import { servicePriceInRupees } from '../lib/pricing'
 
 const router = Router()
 
@@ -83,6 +84,61 @@ router.post('/', optionalAuth, validateBody(applicationCreateSchema), async (req
     ]).catch(() => {})
 
     return res.status(201).json({ applicationId: data.id })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// ── GET /api/applications/lawyer?serviceType=&status= ────────────────────────
+/**
+ * The document queue for the advocate portal. It has called this since it was
+ * built and got a 400 every time — `/:id` matched first and rejected "lawyer"
+ * as a malformed UUID.
+ *
+ * Applications are not assigned to an advocate, so this is the shared queue a
+ * verified advocate works from rather than a personal list.
+ *
+ * MUST stay above GET /:id.
+ */
+router.get('/lawyer', requireAuth, async (req: AuthedRequest, res: Response, next: NextFunction) => {
+  try {
+    const caller = req.user!
+    if (caller.role !== 'lawyer' && caller.role !== 'admin') {
+      return res.status(403).json({ error: 'Not a lawyer account' })
+    }
+
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined
+    const serviceType = typeof req.query.serviceType === 'string' ? req.query.serviceType : undefined
+
+    let query = supabase
+      .from('applications')
+      .select('id, service_slug, status, created_at, leads(name)')
+      .order('created_at', { ascending: false })
+      .limit(100)
+
+    if (status && status !== 'all') query = query.eq('status', status)
+    if (serviceType && serviceType !== 'all') query = query.eq('service_slug', serviceType)
+
+    const { data, error } = await query
+    if (error) throw error
+
+    // form_data is deliberately absent: it holds PAN and Aadhaar, and a queue
+    // listing needs a name and a status, not identity documents.
+    return res.json((data ?? []).map(row => {
+      const lead = Array.isArray(row.leads) ? row.leads[0] : row.leads
+      return {
+        id: row.id,
+        documentType: row.service_slug,
+        status: row.status,
+        clientName: lead?.name ?? 'Client',
+        revisionCount: 0,
+        pageCount: null,
+        verificationTier: null,
+        fee: servicePriceInRupees(row.service_slug) ?? 0,
+        createdAt: row.created_at,
+        deliverableUrl: null,
+      }
+    }))
   } catch (err) {
     next(err)
   }
