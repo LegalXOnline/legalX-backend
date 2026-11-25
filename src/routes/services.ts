@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express'
 import { DOCUMENTS, getDocument } from '../lib/documents'
+import { servicePriceInRupees, govtDutyNote } from '../lib/pricing'
 
 const router = Router()
 
@@ -9,13 +10,11 @@ const router = Router()
  * Public and unauthenticated: this is the same list the website renders, and
  * the mobile app needs it before anyone has signed in. The data is static, so
  * it is served from memory rather than the database.
+ *
+ * `priceNumeric` is what the checkout will charge, from the same helper
+ * create-order uses. It used to strip non-digits out of `pricing.total`, which
+ * only worked by luck.
  */
-
-/** Numeric price in rupees, parsed once from the pricing block. */
-function priceOf(total: string, fallback: number): number {
-  const digits = total.replace(/[^\d]/g, '')
-  return digits ? Number(digits) : fallback
-}
 
 // ── GET /api/services ────────────────────────────────────────────────────────
 // The list view: enough for a card, without the FAQ and form schema that only
@@ -31,7 +30,8 @@ router.get('/', (_req: Request, res: Response) => {
       description: d.shortDesc,
       shortDesc: d.shortDesc,
       priceLine: d.pricing.total,
-      priceNumeric: priceOf(d.pricing.total, d.pricing.drafting),
+      priceNumeric: servicePriceInRupees(d.slug) ?? d.pricing.drafting,
+      govtDuty: govtDutyNote(d.slug),
       duration: d.duration,
       estimatedTime: d.estimatedTime,
       legalAct: d.legalAct,
@@ -66,7 +66,8 @@ router.get('/:slug', (req: Request, res: Response) => {
       id: doc.slug,
       description: doc.shortDesc,
       priceLine: doc.pricing.total,
-      priceNumeric: priceOf(doc.pricing.total, doc.pricing.drafting),
+      priceNumeric: servicePriceInRupees(doc.slug) ?? doc.pricing.drafting,
+      govtDuty: govtDutyNote(doc.slug),
       breadcrumb: `Services / ${doc.tag}`,
       howItWorks: howItWorks(doc.pricing.total),
     },

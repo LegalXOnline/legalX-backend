@@ -1,8 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import Razorpay from 'razorpay'
 import crypto from 'crypto'
-import { supabase, supabaseAuthValidator } from '../lib/supabase'
+import { supabase } from '../lib/supabase'
 import { sendPaymentSuccess } from '../lib/email'
+import { logger } from '../lib/logger'
+import { requireAuth, ownsOrAdmin, type AuthedRequest } from '../lib/auth'
+import { servicePriceInPaise, assertChargeable, govtDutyNote } from '../lib/pricing'
 
 const router = Router()
 
@@ -11,42 +14,29 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET!,
 })
 
-// ── Auth middleware for payment routes ─────────────────────────────────────────
-async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  try {
-    const token = req.cookies?.lx_access_token || req.headers.authorization?.replace('Bearer ', '')
-    if (!token) {
-      return res.status(401).json({ error: 'Not authenticated' })
-    }
+/** True while the configured key is a test key. Surfaced so the UI can say so. */
+const isTestMode = (process.env.RAZORPAY_KEY_ID ?? '').startsWith('rzp_test')
 
-    const { data, error } = await supabaseAuthValidator.auth.getUser(token)
-    if (error || !data.user) {
-      return res.status(401).json({ error: 'Invalid or expired session' })
-    }
-
-    ;(req as any).user = data.user
-    next()
-  } catch {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-}
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // ── POST /api/payment/create-order ───────────────────────────────────────────
-// Create a Razorpay order and return the order_id to frontend
-router.post('/create-order', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+// The client says which application to pay for. It does not say the price —
+// that comes from the server's catalogue. See lib/pricing.ts.
+router.post('/create-order', requireAuth, async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
-    const { applicationId, leadId, serviceSlug, amount } = req.body
-    const userId = (req as any).user.id
+    const caller = req.user!
+    const { applicationId } = req.body
 
-    // amount in paise — e.g. ₹1499 = 149900
-    if (!applicationId || !leadId || !amount || amount < 100) {
-      return res.status(400).json({ error: 'applicationId, leadId and amount (paise) are required' })
+    if (typeof applicationId !== 'string' || !UUID_RE.test(applicationId)) {
+      return res.status(400).json({ error: 'A valid applicationId is required' })
     }
 
-    // Verify the application belongs to this user
+    // serviceSlug comes from the stored row, not the request — letting the
+    // client restate it is how you pay the ₹299 affidavit price for a
+    // ₹1,499 trademark.
     const { data: application, error: appError } = await supabase
       .from('applications')
-      .select('id, lead_id')
+      .select('id, lead_id, service_slug, status, leads(account_id, service_title)')
       .eq('id', applicationId)
       .single()
 
@@ -54,44 +44,89 @@ router.post('/create-order', requireAuth, async (req: Request, res: Response, ne
       return res.status(404).json({ error: 'Application not found' })
     }
 
-    if (application.lead_id !== leadId) {
-      return res.status(400).json({ error: 'Application and lead mismatch' })
+    const lead = Array.isArray(application.leads) ? application.leads[0] : application.leads
+    const ownerId: string | null = lead?.account_id ?? null
+
+    // A guest who has now signed in to pay is the normal path, so claim it.
+    // Anything already owned by someone else is not payable here.
+    if (ownerId === null) {
+      if (caller.role !== 'client') {
+        return res.status(403).json({ error: 'Only a client can pay for an application' })
+      }
+      await supabase.from('leads').update({ account_id: caller.id }).eq('id', application.lead_id)
+    } else if (!ownsOrAdmin(caller, ownerId)) {
+      // 404, not 403 — a 403 confirms the id is real.
+      return res.status(404).json({ error: 'Application not found' })
     }
 
-    // Verify the lead belongs to this user (check via leads table or application)
-    const { data: lead, error: leadError } = await supabase
-      .from('leads')
-      .select('id')
-      .eq('id', leadId)
-      .single()
+    const priced = assertChargeable(servicePriceInPaise(application.service_slug))
+    if (!priced.ok) {
+      logger.error(
+        { applicationId, serviceSlug: application.service_slug, reason: priced.reason },
+        'Refusing to create a Razorpay order',
+      )
+      return res.status(409).json({ error: 'This service is not available for online payment' })
+    }
+    const amount = priced.paise
 
-    if (leadError || !lead) {
-      return res.status(404).json({ error: 'Lead not found' })
+    // The unique index stops a duplicate settlement, not a duplicate order —
+    // and two open orders on one application is how someone pays twice.
+    const { data: settled } = await supabase
+      .from('payments')
+      .select('id')
+      .eq('application_id', applicationId)
+      .eq('status', 'paid')
+      .limit(1)
+      .maybeSingle()
+
+    if (settled) {
+      return res.status(409).json({ error: 'This application has already been paid for' })
     }
 
     const order = await razorpay.orders.create({
       amount,
       currency: 'INR',
       receipt: `lx_${applicationId.slice(0, 8)}`,
-      notes: { applicationId, leadId, serviceSlug, userId },
+      notes: {
+        applicationId,
+        leadId: application.lead_id,
+        serviceSlug: application.service_slug,
+        userId: caller.id,
+      },
     })
 
-    // Persist order in payments table
-    await supabase.from('payments').insert({
+    const { error: insertError } = await supabase.from('payments').insert({
       application_id: applicationId,
-      lead_id: leadId,
+      lead_id: application.lead_id,
       razorpay_order_id: order.id,
       amount,
       currency: 'INR',
       status: 'created',
-      service_slug: serviceSlug,
+      service_slug: application.service_slug,
     })
+
+    // The order exists at Razorpay but we have no record of it. Verify looks
+    // it up by id, so staying quiet here would reject a real payment later.
+    if (insertError) {
+      logger.error(
+        { err: insertError, razorpayOrderId: order.id, applicationId },
+        'Razorpay order created but payments row insert failed',
+      )
+      return res.status(500).json({ error: 'Could not start payment. Please try again.' })
+    }
 
     return res.json({
       orderId: order.id,
       amount: order.amount,
       currency: order.currency,
       keyId: process.env.RAZORPAY_KEY_ID,
+      // So the UI can say "test" instead of leaving someone wondering why no
+      // money moved.
+      testMode: isTestMode,
+      serviceTitle: lead?.service_title ?? null,
+      // Not part of `amount` — the client pays the registry direct. Sent so
+      // the Android app, which has no local catalogue, can show it too.
+      govtDuty: govtDutyNote(application.service_slug),
     })
   } catch (err) {
     next(err)
@@ -100,30 +135,38 @@ router.post('/create-order', requireAuth, async (req: Request, res: Response, ne
 
 // ── POST /api/payment/verify ─────────────────────────────────────────────────
 // Verify Razorpay signature after successful payment
-router.post('/verify', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/verify', requireAuth, async (req: AuthedRequest, res: Response, next: NextFunction) => {
   try {
+    const caller = req.user!
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body
-    const userId = (req as any).user.id
 
-    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+    if (
+      typeof razorpayOrderId !== 'string' ||
+      typeof razorpayPaymentId !== 'string' ||
+      typeof razorpaySignature !== 'string' ||
+      !razorpayOrderId || !razorpayPaymentId || !razorpaySignature
+    ) {
       return res.status(400).json({ error: 'Missing payment fields' })
     }
 
-    // Verify HMAC signature
+    // Constant-time: a plain !== leaks byte by byte how much of a forged
+    // signature was right, which is enough to build a valid one.
     const expectedSig = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
       .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest('hex')
+      .digest()
+    const givenSig = Buffer.from(razorpaySignature, 'hex')
 
-    if (expectedSig !== razorpaySignature) {
-      console.warn('[payment] signature mismatch', { razorpayOrderId })
+    if (givenSig.length !== expectedSig.length || !crypto.timingSafeEqual(givenSig, expectedSig)) {
+      logger.warn({ razorpayOrderId, callerId: caller.id }, '[payment] signature mismatch')
       return res.status(400).json({ error: 'Invalid payment signature' })
     }
 
-    // Get payment record to verify ownership and get applicationId/leadId
+    // The order row is authoritative. Nothing from the body is trusted past
+    // the signature check.
     const { data: payment, error: paymentError } = await supabase
       .from('payments')
-      .select('application_id, lead_id, amount, service_slug, status')
+      .select('application_id, lead_id, amount, service_slug, status, applications(leads(account_id))')
       .eq('razorpay_order_id', razorpayOrderId)
       .single()
 
@@ -131,27 +174,33 @@ router.post('/verify', requireAuth, async (req: Request, res: Response, next: Ne
       return res.status(404).json({ error: 'Payment record not found' })
     }
 
-    if (payment.status === 'paid') {
-      return res.status(400).json({ error: 'Payment already processed' })
+    // Ownership — which this route only claimed to check before. It loaded
+    // the application and then compared nothing against the caller.
+    const application = Array.isArray(payment.applications) ? payment.applications[0] : payment.applications
+    const leadRow = Array.isArray(application?.leads) ? application?.leads[0] : application?.leads
+    const ownerId: string | null = leadRow?.account_id ?? null
+
+    if (!ownsOrAdmin(caller, ownerId)) {
+      logger.warn(
+        { razorpayOrderId, callerId: caller.id, ownerId },
+        '[payment] verify attempted by a caller who does not own the order',
+      )
+      return res.status(404).json({ error: 'Payment record not found' })
     }
 
-    // Verify the application belongs to this user
-    const { data: application, error: appError } = await supabase
-      .from('applications')
-      .select('id, lead_id')
-      .eq('id', payment.application_id)
-      .single()
-
-    if (appError || !application) {
-      return res.status(404).json({ error: 'Application not found' })
-    }
-
-    // Use the payment record's data, not client-provided values
     const applicationId = payment.application_id
     const leadId = payment.lead_id
 
-    // Update payments table
-    const { error: updateError } = await supabase
+    // Razorpay's checkout can fire twice and the webhook races this route.
+    // Whichever lands second must be a no-op, not an error shown to someone
+    // whose money has already moved.
+    if (payment.status === 'paid') {
+      return res.json({ ok: true, status: 'paid', alreadyProcessed: true })
+    }
+
+    // Guarded on status so two concurrent settlements cannot both send a
+    // receipt — the loser updates nothing and returns the same success.
+    const { data: claimed, error: updateError } = await supabase
       .from('payments')
       .update({
         razorpay_payment_id: razorpayPaymentId,
@@ -159,8 +208,14 @@ router.post('/verify', requireAuth, async (req: Request, res: Response, next: Ne
         status: 'paid',
       })
       .eq('razorpay_order_id', razorpayOrderId)
+      .eq('status', 'created')
+      .select('application_id')
 
     if (updateError) throw updateError
+
+    if (!claimed || claimed.length === 0) {
+      return res.json({ ok: true, status: 'paid', alreadyProcessed: true })
+    }
 
     // Update application status
     await supabase

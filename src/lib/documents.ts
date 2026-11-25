@@ -614,3 +614,44 @@ export const DOCUMENTS: LegalDocument[] = [
 export function getDocument(slug: string): LegalDocument | undefined {
   return DOCUMENTS.find((d) => d.slug === slug)
 }
+
+// ── Pricing ──────────────────────────────────────────────────────────────────
+//
+// What LegalX charges, from the structured fields rather than parsed out of
+// `pricing.total` — that is display copy ("₹1,499 + Govt. fee", "Free–₹299")
+// and stripping its digits only works by luck. The checkout and the server
+// both read these, so shown and charged cannot drift.
+//
+// Statutory fees are excluded: LegalX never collects them, the client pays the
+// registry direct.
+
+/** The LegalX fee for a service, in rupees. `null` when the slug is unknown. */
+export function servicePriceInRupees(slug: string): number | null {
+  const doc = getDocument(slug)
+  if (!doc) return null
+
+  const rupees = doc.pricing.drafting + doc.pricing.platformFee
+  return Number.isFinite(rupees) && rupees > 0 ? rupees : null
+}
+
+/** The same figure in paise, which is the unit every payment gateway wants. */
+export function servicePriceInPaise(slug: string): number | null {
+  const rupees = servicePriceInRupees(slug)
+  return rupees === null ? null : Math.round(rupees * 100)
+}
+
+/** `₹1,499` — the amount due, formatted for Indian digit grouping. */
+export function formatRupees(rupees: number): string {
+  return `₹${rupees.toLocaleString('en-IN')}`
+}
+
+/** The statutory fee note, or null so a checkout can omit the row entirely. */
+export function govtDutyNote(slug: string): string | null {
+  const doc = getDocument(slug)
+  if (!doc) return null
+
+  const duty = doc.pricing.govtDuty.trim()
+  if (!duty || /^nil\b/i.test(duty)) return null
+
+  return duty
+}
