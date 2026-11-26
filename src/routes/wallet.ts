@@ -5,6 +5,7 @@ import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
 import { validateBody, walletTopupOrderSchema, walletTopupVerifySchema } from '../lib/validation'
 import { getAuthUser } from '../lib/auth'
+import { isValidPaymentSignature, isTestKey, orderMatches } from '../lib/razorpay'
 
 /**
  * The client's wallet.
@@ -26,7 +27,7 @@ const razorpay = new Razorpay({
 })
 
 /** True while the configured key is a test key. Surfaced so the UI can say so. */
-const isTestMode = (process.env.RAZORPAY_KEY_ID ?? '').startsWith('rzp_test')
+const isTestMode = isTestKey(process.env.RAZORPAY_KEY_ID)
 
 // ── GET /api/wallet ──────────────────────────────────────────────────────────
 router.get('/', async (req: Request, res: Response) => {
@@ -121,14 +122,7 @@ router.post('/topup/verify', validateBody(walletTopupVerifySchema), async (req: 
       razorpayOrderId: string; razorpayPaymentId: string; razorpaySignature: string
     }
 
-    const expected = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
-      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest('hex')
-
-    const a = Buffer.from(expected)
-    const b = Buffer.from(razorpaySignature)
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    if (!isValidPaymentSignature(razorpayOrderId, razorpayPaymentId, razorpaySignature, process.env.RAZORPAY_KEY_SECRET!)) {
       logger.warn({ razorpayOrderId }, '[wallet] signature mismatch on top-up')
       res.status(400).json({ error: 'That payment could not be verified.' })
       return
@@ -159,14 +153,11 @@ router.post('/topup/verify', validateBody(walletTopupVerifySchema), async (req: 
      * could be replayed here and credited to the wallet as Rs 1,499. One
      * payment, spent twice.
      */
-    if (order.notes?.purpose !== 'wallet_topup') {
-      logger.warn({ razorpayOrderId, user: user.id, purpose: order.notes?.purpose }, '[wallet] order is not a top-up')
-      res.status(400).json({ error: 'That payment was not a wallet top-up.' })
-      return
-    }
-    if (order.notes?.accountId !== user.id) {
-      logger.warn({ razorpayOrderId, user: user.id }, '[wallet] order belongs to another account')
-      res.status(403).json({ error: 'That payment belongs to another account.' })
+    if (!orderMatches(order.notes as Record<string, unknown> | undefined,
+                      { purpose: 'wallet_topup', accountId: user.id })) {
+      logger.warn({ razorpayOrderId, user: user.id, purpose: order.notes?.purpose },
+                  '[wallet] order is not this account\'s top-up')
+      res.status(400).json({ error: 'That payment was not a wallet top-up for this account.' })
       return
     }
 

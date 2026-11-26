@@ -6,6 +6,7 @@ import { sendPaymentSuccess } from '../lib/email'
 import { logger } from '../lib/logger'
 import { requireAuth, ownsOrAdmin, type AuthedRequest } from '../lib/auth'
 import { servicePriceInPaise, assertChargeable, govtDutyNote } from '../lib/pricing'
+import { isValidPaymentSignature, isTestKey } from '../lib/razorpay'
 
 const router = Router()
 
@@ -15,7 +16,7 @@ const razorpay = new Razorpay({
 })
 
 /** True while the configured key is a test key. Surfaced so the UI can say so. */
-const isTestMode = (process.env.RAZORPAY_KEY_ID ?? '').startsWith('rzp_test')
+const isTestMode = isTestKey(process.env.RAZORPAY_KEY_ID)
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -149,15 +150,7 @@ router.post('/verify', requireAuth, async (req: AuthedRequest, res: Response, ne
       return res.status(400).json({ error: 'Missing payment fields' })
     }
 
-    // Constant-time: a plain !== leaks byte by byte how much of a forged
-    // signature was right, which is enough to build a valid one.
-    const expectedSig = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET!)
-      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest()
-    const givenSig = Buffer.from(razorpaySignature, 'hex')
-
-    if (givenSig.length !== expectedSig.length || !crypto.timingSafeEqual(givenSig, expectedSig)) {
+    if (!isValidPaymentSignature(razorpayOrderId, razorpayPaymentId, razorpaySignature, process.env.RAZORPAY_KEY_SECRET!)) {
       logger.warn({ razorpayOrderId, callerId: caller.id }, '[payment] signature mismatch')
       return res.status(400).json({ error: 'Invalid payment signature' })
     }
