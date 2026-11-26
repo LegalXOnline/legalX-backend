@@ -298,6 +298,10 @@ router.post('/initiate', validateBody(initiateSchema), async (req: Request, res:
       consultationId: consultation.id,
       fundedBy: 'razorpay',
       razorpayOrderId: order.id,
+      // From the server, like every other checkout here. A NEXT_PUBLIC_ build
+      // variable is one more thing to set per deploy and forget — and when it
+      // is missing the modal opens with key undefined and simply never loads.
+      keyId: process.env.RAZORPAY_KEY_ID,
       amount: amountPaise,
       currency: 'INR',
       lawyerName,
