@@ -3,6 +3,7 @@ import crypto from 'crypto'
 import Razorpay from 'razorpay'
 import { supabase } from '../lib/supabase'
 import { logger } from '../lib/logger'
+import { isValidWebhookSignature } from '../lib/razorpay'
 import { createNotification } from '../lib/notify'
 
 const router = Router()
@@ -37,10 +38,7 @@ router.post('/razorpay', async (req: Request, res: Response) => {
       return
     }
 
-    const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex')
-    const sigBuf = Buffer.from(signature)
-    const expBuf = Buffer.from(expected)
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    if (!isValidWebhookSignature(raw, signature, secret)) {
       logger.warn({ reqId: req.id }, '[webhook/razorpay] signature mismatch')
       res.status(401).json({ error: 'Invalid signature' })
       return
