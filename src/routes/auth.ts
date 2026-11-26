@@ -115,24 +115,58 @@ setInterval(() => {
 // Keyed by lowercase email.
 const SIGNUP_OTP_TTL_MS = 10 * 60 * 1000
 
+/**
+ * What a pending signup pins. No password: the client sends it again on
+ * verification, so storing one would be a secret at rest that nothing reads.
+ */
 interface SignupOtpEntry {
   otp: string
   firstName: string
   lastName: string
-  password: string
   role: 'client' | 'lawyer'
   createdAt: number
 }
 
-const signupOtpStore = new Map<string, SignupOtpEntry>()
+/**
+ * Pending signups live in the database, not in this process. [BE-02]
+ *
+ * A Map meant the code stopped working whenever the service slept — which on
+ * the free tier is between almost every signup and its verification. Expired
+ * rows are swept by /api/jobs/retention; a stale one is also rejected on read,
+ * so the sweep is housekeeping rather than correctness.
+ */
+async function putPendingSignup(email: string, entry: SignupOtpEntry): Promise<void> {
+  const { error } = await supabase.from('pending_signups').upsert({
+    email,
+    otp: entry.otp,
+    first_name: entry.firstName,
+    last_name: entry.lastName,
+    role: entry.role,
+    created_at: new Date().toISOString(),
+  }, { onConflict: 'email' })
+  if (error) throw error
+}
 
-// Prune expired signup OTPs every 2 minutes
-setInterval(() => {
-  const cutoff = Date.now() - SIGNUP_OTP_TTL_MS
-  for (const [email, entry] of signupOtpStore) {
-    if (entry.createdAt < cutoff) signupOtpStore.delete(email)
+async function takePendingSignup(email: string): Promise<SignupOtpEntry | null> {
+  const { data } = await supabase
+    .from('pending_signups')
+    .select('otp, first_name, last_name, role, created_at')
+    .eq('email', email)
+    .maybeSingle()
+
+  if (!data) return null
+
+  const createdAt = Date.parse(data.created_at)
+  if (!Number.isFinite(createdAt) || Date.now() - createdAt > SIGNUP_OTP_TTL_MS) return null
+
+  return {
+    otp: data.otp,
+    firstName: data.first_name,
+    lastName: data.last_name,
+    role: data.role as 'client' | 'lawyer',
+    createdAt,
   }
-}, 2 * 60 * 1000).unref()
+}
 
 function generateOtp(): string {
   // Cryptographically random 6-digit code
@@ -168,15 +202,9 @@ router.post(
 
       const otp = generateOtp()
 
-      // Store the pending signup data (overwrites any previous OTP for this email)
-      signupOtpStore.set(email, {
-        otp,
-        firstName,
-        lastName,
-        password,
-        role,
-        createdAt: Date.now(),
-      })
+      // Overwrites any previous code for this email, so requesting a new one
+      // invalidates the old.
+      await putPendingSignup(email, { otp, firstName, lastName, role, createdAt: Date.now() })
 
       // Send OTP email (fire-and-forget)
       sendSignupOtpEmail(email, otp, firstName).catch(err =>
@@ -201,7 +229,9 @@ router.post(
   validateBody(signupVerifyOtpSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { email, otp, password, firstName, lastName, role = 'client' } = req.body
+      // firstName, lastName and role are deliberately not read from the body —
+      // the pending row pins them. See the createUser call below.
+      const { email, otp, password } = req.body
 
       const otpKey = `signup:${email}`
 
@@ -212,7 +242,7 @@ router.post(
         return
       }
 
-      const entry = signupOtpStore.get(email)
+      const entry = await takePendingSignup(email)
 
       // Check if OTP exists and hasn't expired
       if (!entry || Date.now() - entry.createdAt > SIGNUP_OTP_TTL_MS) {
@@ -232,15 +262,24 @@ router.post(
         return
       }
 
-      // OTP is valid — create the user
-      // Use the password from the stored entry (validated at Step 1), not from
-      // the request body, to prevent someone changing the password between steps.
-      // However, the schema validates both, and we use the request body password
-      // since the user should be able to correct it if they want.
+      /**
+       * Name and role come from the stored request, not this one.
+       *
+       * They were read from the body, so someone could ask for a code as a
+       * client and verify as a lawyer — handing themselves an advocate
+       * account. The pending row exists to pin exactly this.
+       *
+       * The password still comes from the body: the code proves the email is
+       * theirs, and the password is theirs to choose or correct.
+       */
       const { data, error } = await supabase.auth.admin.createUser({
         email,
         password,
-        user_metadata: { first_name: firstName, last_name: lastName, role },
+        user_metadata: {
+          first_name: entry.firstName,
+          last_name: entry.lastName,
+          role: entry.role,
+        },
         email_confirm: true, // Email is verified — OTP proves ownership
       })
 
@@ -262,16 +301,16 @@ router.post(
         return
       }
 
-      // Clean up OTP store
-      signupOtpStore.delete(email)
+      // Spent. Deleting it is what stops one code creating two accounts.
+      await supabase.from('pending_signups').delete().eq('email', email)
       otpAttempts.delete(otpKey)
 
       // Send welcome email
       if (data.user?.email) {
-        if (role === 'lawyer') {
-          sendLawyerOnboardingWelcome(data.user.email, firstName).catch(console.error)
+        if (entry.role === 'lawyer') {
+          sendLawyerOnboardingWelcome(data.user.email, entry.firstName).catch(console.error)
         } else {
-          sendWelcomeEmail(data.user.email, firstName, role).catch(console.error)
+          sendWelcomeEmail(data.user.email, entry.firstName, entry.role).catch(console.error)
         }
       }
 

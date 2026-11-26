@@ -106,6 +106,12 @@ router.post('/retention', requireJobSecret, async (_req: Request, res: Response)
     supabase.from('notifications').delete({ count: 'exact' })
       .eq('is_read', false).lt('created_at', daysAgo(365)))
 
+  // A signup code is good for ten minutes. An hour is generous, and keeps the
+  // table from growing on abandoned signups.
+  await prune('pending_signups', async () =>
+    supabase.from('pending_signups').delete({ count: 'exact' })
+      .lt('created_at', new Date(now - 3_600_000).toISOString()))
+
   // Ring signals expire in seconds; anything from yesterday is dead weight.
   await prune('call_rings', async () =>
     supabase.from('consultation_notifications').delete({ count: 'exact' })
