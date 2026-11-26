@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # The suite is pure — no database, no network, no clock of its own — so
+      # it needs none of the real secrets. These only satisfy the module-load
+      # guards in lib/supabase.ts and lib/auth.ts.
+      - name: Test
+        run: npm test
+        env:
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: ci-placeholder
+          SUPABASE_ANON_KEY: ci-placeholder
+          ADMIN_SECRET: ci-placeholder
+          RAZORPAY_KEY_ID: rzp_test_ci
+          RAZORPAY_KEY_SECRET: ci-placeholder
+
+      - name: Build
+        run: npm run build
+
+      # Catches the mistake that actually happened: a route reading a variable
+      # nobody wrote down, so a deploy comes up missing something.
+      - name: Every env var the code reads is documented
+        run: |
+          grep -rhoE 'process\.env\.[A-Z_0-9]+' src/ | sed 's/process\.env\.//' | sort -u > /tmp/used
+          grep -oE '^#? ?[A-Z_0-9]+=' .env.example | tr -d '#= ' | sort -u > /tmp/doc
+          # RENDER and RENDER_EXTERNAL_URL are injected by the platform.
+          printf 'RENDER\nRENDER_EXTERNAL_URL\n' >> /tmp/doc
+          sort -u -o /tmp/doc /tmp/doc
+          missing=$(comm -23 /tmp/used /tmp/doc)
+          if [ -n "$missing" ]; then
+            echo "::error::Undocumented in .env.example:"; echo "$missing"; exit 1
+          fi
+          echo "All documented."
