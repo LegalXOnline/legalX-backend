@@ -26,6 +26,7 @@ import shortsRouter from './routes/shorts'
 import knowledgeRouter from './routes/knowledge'
 import jobsRouter from './routes/jobs'
 import contactRouter from './routes/contact'
+import accountRouter from './routes/account'
 
 // Extend Express Request type
 declare global {
@@ -268,6 +269,8 @@ app.use('/api/profile', validateCsrf, profileRouter)
 app.use('/api/wallet', validateCsrf, walletRouter)
 app.use('/api/admin', validateCsrf, adminRouter)
 app.use('/api/consultations', validateCsrf, consultationsRouter)
+// The client's own account area: orders, saved items, support.
+app.use('/api/account', validateCsrf, accountRouter)
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
