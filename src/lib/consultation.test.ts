@@ -15,6 +15,7 @@ import {
   balanceState,
   type ClockRow,
   isUsableAccount,
+  sweepAction,
 } from './consultation'
 
 const LAWYER = '11111111-1111-1111-1111-111111111111'
@@ -302,5 +303,49 @@ describe('suspended accounts lose API access', () => {
     for (const s of ['suspended', 'banned', 'pending_deletion']) {
       assert.equal(isUsableAccount(s), false, s)
     }
+  })
+})
+
+// ── Sweeping ─────────────────────────────────────────────────────────────────
+
+describe('consultations nobody closed', () => {
+  const NOW_MS = Date.parse('2026-11-26T12:00:00Z')
+  const ago = (ms: number) => new Date(NOW_MS - ms).toISOString()
+  const mins = (n: number) => n * 60_000
+  const hours = (n: number) => n * 3_600_000
+
+  test('a fresh ring is left alone', () => {
+    assert.equal(sweepAction({ status: 'pending', started_at: null, created_at: ago(mins(5)) }, NOW_MS), null)
+  })
+
+  test('a ring nobody answered is cancelled, not billed', () => {
+    assert.equal(sweepAction({ status: 'pending', started_at: null, created_at: ago(mins(31)) }, NOW_MS), 'cancel')
+    // The ones found in production: 70+ days old.
+    assert.equal(sweepAction({ status: 'pending', started_at: null, created_at: ago(hours(2057)) }, NOW_MS), 'cancel')
+  })
+
+  test('a call in progress is left alone while it could still be real', () => {
+    assert.equal(sweepAction({ status: 'in_progress', started_at: ago(mins(45)), created_at: ago(mins(50)) }, NOW_MS), null)
+  })
+
+  test('a call still running after hours is settled, not cancelled', () => {
+    // Settled, because two people were in a room: the time used is billable.
+    assert.equal(sweepAction({ status: 'in_progress', started_at: ago(hours(5)), created_at: ago(hours(5)) }, NOW_MS), 'settle')
+  })
+
+  test('age is measured from the start, not from creation', () => {
+    // Created long ago but only started recently — still a live call.
+    assert.equal(sweepAction({ status: 'in_progress', started_at: ago(mins(2)), created_at: ago(hours(9)) }, NOW_MS), null)
+  })
+
+  test('a finished consultation is never swept', () => {
+    for (const status of ['completed', 'cancelled']) {
+      assert.equal(sweepAction({ status, started_at: ago(hours(99)), created_at: ago(hours(99)) }, NOW_MS), null, status)
+    }
+  })
+
+  test('an unparseable timestamp is left alone rather than guessed at', () => {
+    assert.equal(sweepAction({ status: 'pending', started_at: null, created_at: 'nonsense' }, NOW_MS), null)
+    assert.equal(sweepAction({ status: 'in_progress', started_at: 'nonsense', created_at: ago(hours(9)) }, NOW_MS), null)
   })
 })

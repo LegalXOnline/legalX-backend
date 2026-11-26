@@ -3,6 +3,8 @@ import { logger } from '../lib/logger'
 import { supabase } from '../lib/supabase'
 import { FEED_SOURCES } from '../lib/sources/rss'
 import { requireJobSecret } from '../lib/auth'
+import { sweepAction } from '../lib/consultation'
+import { settleConsultation } from './consultations'
 
 const router = Router()
 
@@ -18,6 +20,56 @@ const router = Router()
  *
  * requireJobSecret is in lib/auth.ts and reads `x-admin-secret` specifically.
  */
+
+// ── POST /api/jobs/sweep-consultations ───────────────────────────────────────
+/**
+ * Closes the consultations nobody closed. [PAY-05]
+ *
+ * A call only settles when someone presses end. Anything else — a killed app,
+ * a closed laptop, a ring nobody answered — leaves the row open forever. The
+ * live table had six sitting pending for seventy to eighty-five days, one of
+ * them still holding credit reserved against a client's balance.
+ *
+ * settleConsultation already knows both cases: no started_at is a missed call
+ * and free, and a started one bills the time actually used. This only decides
+ * which rows have waited long enough, and that rule is tested.
+ */
+router.post('/sweep-consultations', requireJobSecret, async (_req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('consultations')
+      .select('id, status, started_at, created_at')
+      .in('status', ['pending', 'in_progress'])
+      .limit(500)
+
+    if (error) throw error
+
+    const now = Date.now()
+    let cancelled = 0
+    let settled = 0
+    const failures: string[] = []
+
+    for (const row of data ?? []) {
+      const action = sweepAction(row, now)
+      if (!action) continue
+      try {
+        // One failure must not abandon the rest of the sweep.
+        await settleConsultation(row.id)
+        if (action === 'settle') settled++
+        else cancelled++
+      } catch (err) {
+        failures.push(row.id)
+        logger.error({ err, consultationId: row.id }, '[sweep] could not settle')
+      }
+    }
+
+    logger.info({ examined: data?.length ?? 0, cancelled, settled, failed: failures.length }, '[sweep] done')
+    res.json({ ok: true, examined: data?.length ?? 0, cancelled, settled, failed: failures.length })
+  } catch (err) {
+    logger.error({ err }, '[sweep] failed')
+    res.status(500).json({ error: 'Sweep failed' })
+  }
+})
 
 // ── POST /api/jobs/retention ─────────────────────────────────────────────────
 // Housekeeping. Supabase's free tier is 500 MB and three tables grow without

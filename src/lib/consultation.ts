@@ -209,3 +209,49 @@ export function balanceState(
 export function isUsableAccount(status: string | null | undefined): boolean {
   return status == null || status === 'active'
 }
+
+// ── Sweeping the ones nobody closed ──────────────────────────────────────────
+
+/**
+ * A ring nobody answered. Twenty seconds is the window, so anything still
+ * pending after this was never going to connect.
+ */
+export const STALE_PENDING_MINUTES = 30
+
+/**
+ * A call still running after this long was almost certainly abandoned — a
+ * killed app, a closed laptop — rather than genuinely in progress. Generous
+ * on purpose: cutting a real consultation short is worse than settling a dead
+ * one late.
+ */
+export const STALE_RUNNING_HOURS = 4
+
+export type SweepAction = 'cancel' | 'settle' | null
+
+/**
+ * What to do with a consultation nobody closed.
+ *
+ * `cancel` is a missed call: never started, so free. `settle` bills what was
+ * actually used, exactly as ending it normally would. Returning null is the
+ * common case and means leave it alone.
+ */
+export function sweepAction(
+  row: { status: string; started_at: string | null; created_at: string },
+  now: number = Date.now(),
+): SweepAction {
+  if (row.status !== 'pending' && row.status !== 'in_progress') return null
+
+  const created = Date.parse(row.created_at)
+  if (!Number.isFinite(created)) return null
+  const ageMs = now - created
+
+  // Started means two people were in a room together. However it ended, the
+  // time used has to be billed rather than written off.
+  if (row.started_at) {
+    const started = Date.parse(row.started_at)
+    if (!Number.isFinite(started)) return null
+    return now - started > STALE_RUNNING_HOURS * 3_600_000 ? 'settle' : null
+  }
+
+  return ageMs > STALE_PENDING_MINUTES * 60_000 ? 'cancel' : null
+}
